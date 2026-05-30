@@ -28,8 +28,8 @@ export interface BotButton {
   payload: string
 }
 
-const POSITIVE_RE = /^(ha|yes|da|ok|tasdiq|aha|albatta|sure|yep|qabul)$/i
-const NEGATIVE_RE = /^(yo'?q|yoq|no|net|нет|bekor|cancel|reject|rad)$/i
+const POSITIVE_RE = /^(ha|yes|da|да|ок|ага|конечно|давай|принято|подтверждаю|ok|tasdiq|aha|albatta|sure|yep|qabul)$/i
+const NEGATIVE_RE = /^(yo'?q|yoq|no|net|нет|не|отмена|отклонить|bekor|cancel|reject|rad)$/i
 
 function decorateLabel(label: string): string {
   const s = label.trim()

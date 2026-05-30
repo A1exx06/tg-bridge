@@ -189,7 +189,7 @@ function renderAwaitingUserPrompt(tool: string, args: Record<string, unknown>): 
       ? (args as { questions: Array<Record<string, unknown>> }).questions
       : []
     if (questions.length === 0) return null
-    const lines: string[] = ['<b>❓ Agent savol berdi:</b>', '']
+    const lines: string[] = ['<b>❓ Агент задал вопрос:</b>', '']
     for (const q of questions) {
       const qText = typeof q.question === 'string' ? q.question : ''
       if (qText) lines.push(escapeHtml(qText))
@@ -202,16 +202,16 @@ function renderAwaitingUserPrompt(tool: string, args: Record<string, unknown>): 
       }
       lines.push('')
     }
-    lines.push("<i>Javobni shu chatga oddiy matn bilan yozing — Claude modal'iga uzatiladi.</i>")
+    lines.push('<i>Напишите ответ обычным текстом в этот чат — он будет передан агенту.</i>')
     return lines.join('\n')
   }
   if (tool === 'ExitPlanMode') {
     const plan = typeof (args as { plan?: unknown }).plan === 'string'
       ? (args as { plan: string }).plan
       : ''
-    const head = "<b>📋 Agent rejani tasdiqlash so'rayapti:</b>\n\n"
+    const head = '<b>📋 Агент просит подтвердить план:</b>\n\n'
     const body = plan ? `<pre>${escapeHtml(plan)}</pre>\n\n` : ''
-    return head + body + "<i>Tasdiqlash: \"ha\" deb yozing yoki o'zgartirish kerakli matnni yuboring.</i>"
+    return head + body + '<i>Подтвердить: напишите «да», либо пришлите нужные правки.</i>'
   }
   return null
 }
@@ -431,7 +431,7 @@ const onTelegramMessage = async (msg: {
   let text = msg.text ?? msg.caption ?? ''
   const savedPath = await saveIfFile(msg)
   if (savedPath) {
-    const prefix = `Operator fayl yubordi: ${savedPath}`
+    const prefix = `Оператор прислал файл: ${savedPath}`
     text = text ? `${prefix}\n${text}` : prefix
   }
   if (!text) {
@@ -489,6 +489,47 @@ const relay = createRelay({
   defaultDecision: cfg.limits.permission_default,
 })
 
+// --- Login watchdog --------------------------------------------------------
+// Claude Code OAuth tokens expire on a long-running session (token rotation
+// race when several agents share one Max account, manual logout, etc). On
+// expiry the live session goes silent — no hook fires, the pane just shows
+// "Please run /login · API Error: 401" and the operator notices only by
+// manually attaching. This independent probe captures the pane on an interval
+// (works even while IDLE) and alerts the owner exactly once per outage.
+const AUTH_FAIL_RE =
+  /please run \/login|api error: 401|invalid authentication|unauthorized request|oauth token has expired/i
+let authAlerted = false
+if (cfg.limits.login_watchdog_ms > 0) {
+  setInterval(() => {
+    void (async () => {
+      try {
+        const pane = await tmux.capturePane()
+        if (AUTH_FAIL_RE.test(pane)) {
+          if (!authAlerted) {
+            authAlerted = true
+            log.warn('auth failure detected in pane — login required', {
+              session: cfg.claude.tmux_session,
+            })
+            if (ownerChatId) {
+              await bot.sendHtml(
+                ownerChatId,
+                `⚠️ <b>tg-bridge: слетела авторизация Claude</b>\n\n` +
+                  `Агент <code>${cfg.claude.tmux_session}</code> не достучался до API (401 / нужен /login). Бот молчит.\n\n` +
+                  `Починить:\n<pre>tmux -L ${cfg.claude.tmux_socket} attach -t ${cfg.claude.tmux_session}\n# в prompt: /login → открыть URL → код обратно\n# выйти: Ctrl-B затем D</pre>`,
+              )
+            }
+          }
+        } else {
+          authAlerted = false // session healthy again — re-arm for next outage
+        }
+      } catch (err) {
+        log.warn('login watchdog capturePane failed', { error: String(err) })
+      }
+    })()
+  }, cfg.limits.login_watchdog_ms)
+  log.info('login watchdog armed', { interval_ms: cfg.limits.login_watchdog_ms })
+}
+
 const server = await startHttpServer({
   host: cfg.bridge.host,
   port: cfg.bridge.port,
@@ -506,7 +547,7 @@ const server = await startHttpServer({
     if (Array.isArray(b.attachments) && b.attachments.length > 0) {
       const lines = b.attachments
         .filter((a) => a && typeof a.path === 'string' && a.path.length > 0)
-        .map((a) => `Operator fayl yubordi: ${a.path}`)
+        .map((a) => `Оператор прислал файл: ${a.path}`)
       if (lines.length > 0) text = (text ? text + '\n' : '') + lines.join('\n')
     }
     // Infer channel: explicit `channel` wins; else agentId/from_agent ⇒ swarm push;
