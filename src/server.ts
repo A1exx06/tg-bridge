@@ -3,6 +3,9 @@ import { createLogger } from './log.js'
 import { createFsm, ClaudeState } from './claude/state.js'
 import { createQueue } from './claude/queue.js'
 import { createTmuxSession } from './claude/tmux-session.js'
+import { randomUUID } from 'node:crypto'
+import { homedir } from 'node:os'
+import { loadOrCreateSid, buildClaudeCommand, latestTranscriptSid } from './claude/session-id.js'
 import { createBot } from './telegram/bot.js'
 import { allowMessage } from './telegram/gate.js'
 import { injectSenderPrefix } from './persona/sender-prefix.js'
@@ -79,11 +82,28 @@ const queue = createQueue<QueueItem>({
   maxDepth: cfg.limits.queue_max_depth,
 })
 
+// Stable session id persisted on disk → resume the same conversation across
+// reboot / hardRestart instead of starting fresh (gateway.py's durable-resume).
+// On first run (no sid file yet) adopt the workspace's most recent transcript
+// so the conversation that is already live survives the first respawn too.
+const claudeHome = process.env.HOME ?? homedir()
+const claudeSid = loadOrCreateSid(
+  cfg.paths.state_dir,
+  () => latestTranscriptSid(claudeHome, cfg.claude.workspace) ?? randomUUID(),
+)
+log.info('claude session id', { sid: claudeSid })
 const tmux = createTmuxSession({
   socket: cfg.claude.tmux_socket,
   session: cfg.claude.tmux_session,
   cwd: cfg.claude.workspace,
-  command: `${cfg.claude.binary} ${cfg.claude.flags}`,
+  buildCommand: () =>
+    buildClaudeCommand({
+      binary: cfg.claude.binary,
+      flags: cfg.claude.flags,
+      workspace: cfg.claude.workspace,
+      sid: claudeSid,
+      home: claudeHome,
+    }),
 })
 
 await tmux.ensure()
@@ -178,6 +198,18 @@ let lastPaneFingerprint = ''
 // alive and waiting for the operator. We freeze the heartbeat for these.
 const AWAITING_USER_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode'])
 let awaitingUserTool: string | null = null
+// The option-question message surfaced to Telegram for the active modal. The
+// question already shows in the mirror, so once it's answered we delete this
+// (and the operator's typed answer) — keeping the chat to the mirror + the real
+// conversation. Scoped to this modal only; nothing else is removed.
+let awaitingModal: { chat: number; msgId: number } | null = null
+
+const clearAwaitingModal = (alsoDelete: boolean): void => {
+  if (awaitingModal && alsoDelete) {
+    void bot.deleteMessage(awaitingModal.chat, awaitingModal.msgId).catch(() => {})
+  }
+  awaitingModal = null
+}
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -246,6 +278,7 @@ const armBusyTimer = (): void => {
     if (fsm.current() === ClaudeState.BUSY) {
       log.warn('busy timeout (no activity), forcing IDLE')
       stopPaneWatcher()
+      stopMirror()
       void endTurn('done')
       fsm.forceIdle()
       void drain()
@@ -280,6 +313,92 @@ const stopPaneWatcher = (): void => {
   if (paneWatcher) { clearInterval(paneWatcher); paneWatcher = null; lastPaneFingerprint = '' }
 }
 
+// ── Live terminal mirror ─────────────────────────────────────────────────────
+// During a long/stuck turn, edit a single Telegram message every interval with
+// the latest screen of the tmux pane (last N lines only — old lines drop off so
+// the message never grows past Telegram's 4096-char cap). A delayed start keeps
+// short turns clean; a stale marker flags a frozen/wedged session.
+let mirrorTimer: ReturnType<typeof setInterval> | null = null
+let mirrorStartTimer: ReturnType<typeof setTimeout> | null = null
+let mirrorMsgId: number | null = null
+let mirrorChat: number | null = null
+let mirrorLastBody = ''
+let mirrorLastChangeMs = 0
+let mirrorLastSentHtml = ''
+// When the current turn started — drives the "working — Ns" header on the mirror.
+let turnStartMs = 0
+
+const MIRROR_HARD_CAP = 3500
+const MIRROR_STALE_MS = 90000
+
+const formatMirror = (pane: string, stale: boolean, elapsedSec: number): string => {
+  let lines = pane.split('\n').map((l) => l.replace(/[ \t]+$/, ''))
+  while (lines.length && lines[lines.length - 1] === '') lines.pop()
+  while (lines.length && lines[0] === '') lines.shift()
+  if (lines.length > cfg.mirror.max_lines) lines = lines.slice(-cfg.mirror.max_lines)
+  let body = lines.join('\n')
+  while (body.length > MIRROR_HARD_CAP && lines.length > 1) {
+    lines.shift()
+    body = lines.join('\n')
+  }
+  if (body.length > MIRROR_HARD_CAP) body = body.slice(-MIRROR_HARD_CAP)
+  const name = escapeHtml(cfg.claude.tmux_session)
+  const working = stale
+    ? `⚠️ <b>завис</b> — ${elapsedSec}s · восстановить через <code>/new</code>`
+    : `⏳ <b>работает</b> — ${elapsedSec}s`
+  const head = `${working}\n🖥 <b>${name}</b> — терминал (живой)`
+  return `${head}\n<pre>${escapeHtml(body) || '(пусто)'}</pre>`
+}
+
+const renderMirrorTick = async (): Promise<void> => {
+  if (mirrorChat === null) return
+  let pane: string
+  try { pane = await tmux.capturePane() } catch { return }
+  const bodyKey = pane.replace(/[ \t]+$/gm, '')
+  const now = Date.now()
+  if (bodyKey !== mirrorLastBody) { mirrorLastBody = bodyKey; mirrorLastChangeMs = now }
+  const stale = now - mirrorLastChangeMs >= MIRROR_STALE_MS
+  const elapsedSec = turnStartMs ? Math.round((now - turnStartMs) / 1000) : 0
+  const html = formatMirror(pane, stale, elapsedSec)
+  if (html === mirrorLastSentHtml) return
+  try {
+    if (mirrorMsgId === null) {
+      mirrorMsgId = await bot.sendHtml(mirrorChat, html)
+    } else {
+      await bot.editHtml(mirrorChat, mirrorMsgId, html)
+    }
+    mirrorLastSentHtml = html
+  } catch (err) {
+    log.warn('mirror update failed', { error: String(err) })
+  }
+}
+
+const startMirror = (chatId: number): void => {
+  if (!cfg.mirror.enabled) return
+  stopMirror()
+  mirrorChat = chatId
+  mirrorLastBody = ''
+  mirrorLastChangeMs = Date.now()
+  mirrorLastSentHtml = ''
+  mirrorStartTimer = setTimeout(() => {
+    mirrorStartTimer = null
+    void renderMirrorTick()
+    mirrorTimer = setInterval(() => void renderMirrorTick(), cfg.mirror.interval_ms)
+  }, cfg.mirror.start_delay_ms)
+}
+
+function stopMirror(): void {
+  if (mirrorStartTimer) { clearTimeout(mirrorStartTimer); mirrorStartTimer = null }
+  if (mirrorTimer) { clearInterval(mirrorTimer); mirrorTimer = null }
+  const chat = mirrorChat
+  const msg = mirrorMsgId
+  mirrorChat = null
+  mirrorMsgId = null
+  mirrorLastBody = ''
+  mirrorLastSentHtml = ''
+  if (chat !== null && msg !== null) void bot.deleteMessage(chat, msg).catch(() => {})
+}
+
 const drain = async () => {
   if (fsm.current() !== ClaudeState.IDLE) return
   const next = queue.shift()
@@ -288,6 +407,7 @@ const drain = async () => {
   if (next.web_session_id) origin.web_session_id = next.web_session_id
   lastInbound.set(next.chat_id, origin)
   fsm.onSent()
+  turnStartMs = Date.now()
   const inMeta: Record<string, unknown> = { chat_id: next.chat_id, user_id: next.user_id }
   if (next.channel === 'telegram') inMeta.tg_message_id = next.message_id
   if (next.web_session_id) inMeta.web_session_id = next.web_session_id
@@ -298,6 +418,7 @@ const drain = async () => {
   await tmux.sendKeys(next.text)
   armBusyTimer()
   startPaneWatcher()
+  startMirror(next.chat_id)
 }
 
 const uploadsDir = join(cfg.claude.workspace, '.tg-uploads')
@@ -424,8 +545,51 @@ const onTelegramMessage = async (msg: {
     log.info('denied', { reason: gate, user_id: msg.from.id })
     return
   }
-  if ((msg.text ?? '').trim().toLowerCase() === '/status') {
+  const cmd = (msg.text ?? '').trim().toLowerCase()
+  if (cmd === '/status') {
     await bot.sendHtml(msg.chat.id, renderStatus())
+    return
+  }
+  // Bridge control commands. These must be handled here (not forwarded into the
+  // pane) because when the TUI is wedged, send-keys into Claude is ignored.
+  if (cmd === '/stop') {
+    // Soft interrupt: Escape into the pane + reset bridge turn state to IDLE so
+    // the next message can drain. If the input loop is wedged, use /new instead.
+    disarmBusyTimer()
+    stopPaneWatcher()
+    stopMirror()
+    stopTyping()
+    awaitingUserTool = null
+    clearAwaitingModal(true)
+    await tmux.sendEscape().catch(() => {})
+    await endTurn('done')
+    fsm.forceIdle()
+    void dbSetIdle()
+    await bot.sendHtml(msg.chat.id, "⏹ Отправлен Escape, состояние IDLE. Если завис — <code>/new</code> сделает hard restart.")
+    void drain()
+    return
+  }
+  if (cmd === '/new' || cmd === '/reset' || cmd === '/clear' || cmd === '/kill') {
+    // Hard restart: kill + respawn the Claude process and wipe all bridge state.
+    // Works even when the TUI input loop is dead (the failure mode where typed
+    // /stop and /clear are silently ignored).
+    disarmBusyTimer()
+    stopPaneWatcher()
+    stopMirror()
+    stopTyping()
+    awaitingUserTool = null
+    clearAwaitingModal(true)
+    await endTurnAndDelete()
+    while (queue.shift()) { /* drain pending */ }
+    fsm.forceIdle()
+    void dbSetIdle()
+    try {
+      await tmux.hardRestart()
+      await bot.sendHtml(msg.chat.id, "🔄 Сессия Claude перезапущена (чистый контекст).")
+    } catch (err) {
+      log.warn('hard restart failed', { error: String(err) })
+      await bot.sendHtml(msg.chat.id, "⚠️ ошибка рестарта: " + escapeHtml(String(err)))
+    }
     return
   }
   let text = msg.text ?? msg.caption ?? ''
@@ -455,6 +619,10 @@ const onTelegramMessage = async (msg: {
   if (awaitingUserTool) {
     log.info('routing message into active modal', { tool: awaitingUserTool, text_len: text.length })
     await tmux.sendKeys(text)
+    // Answered the option-question by typing — drop the surfaced question and
+    // this answer message (only this modal's; the rest of the chat stays).
+    clearAwaitingModal(true)
+    void bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {})
     return
   }
   const dropped = queue.push({
@@ -575,6 +743,7 @@ const server = await startHttpServer({
     const originChannel: QueueChannel = origin?.channel ?? 'telegram'
     disarmBusyTimer()
     stopPaneWatcher()
+    stopMirror()
     stopTyping()
     if (targetChat !== undefined && (text.length > 0 || files.length > 0)) {
       await endTurnAndDelete()
@@ -629,6 +798,9 @@ const server = await startHttpServer({
     if (awaitingUserTool && tool === awaitingUserTool) {
       log.info('user answered, resuming heartbeat', { tool })
       awaitingUserTool = null
+      // Modal resolved (possibly answered straight in the TUI) — drop any stale
+      // surfaced question still sitting in the chat.
+      clearAwaitingModal(true)
     }
     armBusyTimer()
     if (active) startPaneWatcher()
@@ -671,6 +843,7 @@ const server = await startHttpServer({
             const html = renderAwaitingUserPrompt(toolName, toolArgs)
             if (html) {
               const msgId = await bot.sendHtml(surfaceChat, html)
+              if (msgId !== null) awaitingModal = { chat: surfaceChat, msgId }
               log.info('modal surfaced to telegram', { chat: surfaceChat, msg_id: msgId })
             } else {
               log.warn('renderAwaitingUserPrompt returned null', { tool: toolName })
@@ -686,6 +859,7 @@ const server = await startHttpServer({
       if (awaitingUserTool) {
         log.info('user activity detected, resuming heartbeat', { prev: awaitingUserTool })
         awaitingUserTool = null
+        clearAwaitingModal(true)
       }
       armBusyTimer()
       if (active) startPaneWatcher()
@@ -757,7 +931,10 @@ await bot.start(async (update) => {
         if (u.callback_query.id) {
           await bot.raw.api.answerCallbackQuery(u.callback_query.id, { text: payload }).catch(() => {})
         }
-        await bot.clearButtons(chatId, msgId)
+        // Answer chosen — the question is in the mirror, so drop the surfaced
+        // option-question message instead of just clearing its buttons.
+        await bot.deleteMessage(chatId, msgId)
+        if (awaitingModal?.msgId === msgId) awaitingModal = null
         queue.push({ chat_id: chatId, user_id: fromId, text: payload, message_id: msgId, channel: 'telegram' })
         void drain()
       }

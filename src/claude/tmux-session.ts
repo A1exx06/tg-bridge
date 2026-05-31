@@ -4,13 +4,18 @@ export interface TmuxSessionOpts {
   socket: string
   session: string
   cwd: string
-  command: string
+  // Re-evaluated on every (re)spawn so the resume flag is recomputed from the
+  // current on-disk transcript state (first boot → --session-id, respawn after
+  // a transcript exists → --resume). See session-id.ts:buildClaudeCommand.
+  buildCommand: () => string
 }
 
 export interface TmuxSession {
   exists(): Promise<boolean>
   ensure(): Promise<void>
   sendKeys(text: string): Promise<void>
+  sendEscape(): Promise<void>
+  hardRestart(): Promise<void>
   capturePane(): Promise<string>
   kill(): Promise<void>
 }
@@ -35,7 +40,7 @@ export function createTmuxSession(opts: TmuxSessionOpts): TmuxSession {
       if (r.ok) return
       const r2 = await run([
         ...baseArgs, 'new-session', '-d', '-s', opts.session,
-        '-c', opts.cwd, opts.command,
+        '-c', opts.cwd, opts.buildCommand(),
       ])
       if (!r2.ok) throw new Error(`tmux new-session failed: ${r2.stderr}`)
     },
@@ -45,6 +50,22 @@ export function createTmuxSession(opts: TmuxSessionOpts): TmuxSession {
       await new Promise((resolve) => setTimeout(resolve, 150))
       const r2 = await run([...baseArgs, 'send-keys', '-t', opts.session, 'Enter'])
       if (!r2.ok) throw new Error(`tmux send-keys (Enter) failed: ${r2.stderr}`)
+    },
+    async sendEscape() {
+      // Soft interrupt — only works while Claude's input loop is responsive.
+      await run([...baseArgs, 'send-keys', '-t', opts.session, 'Escape'])
+    },
+    async hardRestart() {
+      // Kill + respawn the Claude process. Used when the TUI is wedged (modal
+      // stuck, input loop dead/lagged) and no keystroke can recover it. This is
+      // the only reliable /new when send-keys is being ignored.
+      await run([...baseArgs, 'kill-session', '-t', opts.session])
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      const r = await run([
+        ...baseArgs, 'new-session', '-d', '-s', opts.session,
+        '-c', opts.cwd, opts.buildCommand(),
+      ])
+      if (!r.ok) throw new Error(`tmux new-session (restart) failed: ${r.stderr}`)
     },
     async capturePane() {
       const r = await run([...baseArgs, 'capture-pane', '-t', opts.session, '-p'])
