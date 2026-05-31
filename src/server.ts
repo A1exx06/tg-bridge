@@ -666,17 +666,25 @@ const relay = createRelay({
 // (works even while IDLE) and alerts the owner exactly once per outage.
 const AUTH_FAIL_RE =
   /please run \/login|api error: 401|invalid authentication|unauthorized request|oauth token has expired/i
+// Debounce: the pane also renders the live conversation, so a chat that merely
+// mentions "401" / "please run /login" would match. A real outage stays pinned;
+// a chat mention scrolls away. Require two CONSECUTIVE matching captures before
+// alerting — kills false positives from talking about auth, keeps genuine slips.
+const AUTH_STREAK_TO_ALERT = 2
 let authAlerted = false
+let authStreak = 0
 if (cfg.limits.login_watchdog_ms > 0) {
   setInterval(() => {
     void (async () => {
       try {
         const pane = await tmux.capturePane()
         if (AUTH_FAIL_RE.test(pane)) {
-          if (!authAlerted) {
+          authStreak += 1
+          if (authStreak >= AUTH_STREAK_TO_ALERT && !authAlerted) {
             authAlerted = true
             log.warn('auth failure detected in pane — login required', {
               session: cfg.claude.tmux_session,
+              streak: authStreak,
             })
             if (ownerChatId) {
               await bot.sendHtml(
@@ -688,6 +696,7 @@ if (cfg.limits.login_watchdog_ms > 0) {
             }
           }
         } else {
+          authStreak = 0
           authAlerted = false // session healthy again — re-arm for next outage
         }
       } catch (err) {
