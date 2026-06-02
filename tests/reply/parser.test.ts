@@ -90,4 +90,30 @@ describe('parseReply', () => {
     expect(r.files[0]?.path).toBe('/a.png')
     expect(r.files[1]?.path).toBe('/b.pdf')
   })
+
+  test('FILE marker — chat attribute parsed as number', () => {
+    const r = parseReply('[FILE: /x kind=document chat=897656531 caption="hi"]')
+    expect(r.files[0]).toEqual({
+      path: '/x',
+      kind: 'document',
+      chat: 897656531,
+      caption: 'hi',
+    })
+  })
+
+  test('FILE marker — no chat attribute leaves chat undefined', () => {
+    const r = parseReply('[FILE: /tmp/report.pdf]')
+    expect(r.files[0]?.chat).toBeUndefined()
+  })
+
+  test('FILE marker — invalid chat ignored, does not throw', () => {
+    const r = parseReply('[FILE: /tmp/report.pdf chat=abc]')
+    expect(r.files[0]?.path).toBe('/tmp/report.pdf')
+    expect(r.files[0]?.chat).toBeUndefined()
+  })
+
+  test('FILE marker — chat before caption', () => {
+    const r = parseReply('[FILE: /x chat=897656531 caption="report ready"]')
+    expect(r.files[0]).toEqual({ path: '/x', chat: 897656531, caption: 'report ready' })
+  })
 })

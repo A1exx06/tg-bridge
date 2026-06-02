@@ -10,6 +10,7 @@ import { createBot } from './telegram/bot.js'
 import { allowMessage } from './telegram/gate.js'
 import { injectSenderPrefix } from './persona/sender-prefix.js'
 import { parseReply } from './reply/parser.js'
+import { routeFile } from './reply/file-route.js'
 import { formatReplyHtml } from './reply/markdown.js'
 import { startHttpServer } from './hooks/http-server.js'
 import { handleStopHook } from './hooks/stop.js'
@@ -772,7 +773,12 @@ const server = await startHttpServer({
           log.warn('FILE marker path missing', { path: f.path })
           continue
         }
-        await bot.sendFile(targetChat, f)
+        const route = routeFile(f, targetChat, cfg.proactive.file_chats)
+        if (route.action === 'drop') {
+          log.warn('FILE marker dropped', { path: f.path, chat: f.chat ?? null, reason: route.reason })
+          continue
+        }
+        await bot.sendFile(route.chat, f)
       }
       if (originChannel === 'telegram') {
         if (reactions.length === 0 && targetMsg !== undefined) {
