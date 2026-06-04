@@ -21,9 +21,19 @@ export function encodeProjectDir(cwd: string): string {
   return cwd.replace(/[^a-zA-Z0-9]/g, '-')
 }
 
+// Base dir Claude Code uses for transcripts. Honors CLAUDE_CONFIG_DIR when the
+// agent runs under a custom config home (e.g. tg-bridge-wife → ~/.claude-wife,
+// a2meta → ~/.claude-a2meta); falls back to <home>/.claude otherwise. Without
+// this, resume detection for custom-config bots looks in the wrong directory,
+// always picks `--session-id` instead of `--resume`, and claude exits with
+// "Session ID already in use" once a transcript exists → tmux session dies.
+function claudeConfigBase(home: string): string {
+  return process.env.CLAUDE_CONFIG_DIR ?? join(home, '.claude')
+}
+
 // Where Claude Code writes the transcript for (cwd, sid).
 export function transcriptPath(home: string, cwd: string, sid: string): string {
-  return join(home, '.claude', 'projects', encodeProjectDir(cwd), `${sid}.jsonl`)
+  return join(claudeConfigBase(home), 'projects', encodeProjectDir(cwd), `${sid}.jsonl`)
 }
 
 // Pure flag decision. `--session-id` requires an UNUSED id; `--resume` requires
@@ -58,7 +68,7 @@ export function latestTranscriptSid(
   workspace: string,
   list: (dir: string) => TranscriptEntry[] = defaultListTranscripts,
 ): string | null {
-  const dir = join(home, '.claude', 'projects', encodeProjectDir(workspace))
+  const dir = join(claudeConfigBase(home), 'projects', encodeProjectDir(workspace))
   const entries = list(dir)
     .filter((e) => e.name.endsWith('.jsonl'))
     .sort((a, b) => b.mtimeMs - a.mtimeMs)
