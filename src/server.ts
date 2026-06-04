@@ -188,6 +188,12 @@ const endTurnAndDelete = async (): Promise<void> => {
 }
 
 let busyTimer: ReturnType<typeof setTimeout> | null = null
+// Message sent into the tmux pane but not yet acknowledged by any Claude
+// activity (pretool / stop). If the busy timeout fires while this is still
+// set, the send-keys never started a turn (TUI was busy/wedged on the
+// previous turn) and the message was swallowed — so we re-queue it instead of
+// dropping it. Cleared on the first real activity of the turn.
+let inflight: QueueItem | null = null
 let paneWatcher: ReturnType<typeof setInterval> | null = null
 let typingPulse: ReturnType<typeof setInterval> | null = null
 let typingChat: number | null = null
@@ -281,6 +287,13 @@ const armBusyTimer = (): void => {
       stopPaneWatcher()
       stopMirror()
       void endTurn('done')
+      // No activity at all this turn ⇒ the send-keys was swallowed (TUI was
+      // busy/wedged). Re-queue the in-flight message so it isn't lost.
+      if (inflight) {
+        log.warn('re-queuing swallowed message after busy timeout', { len: inflight.text.length })
+        queue.push(inflight)
+        inflight = null
+      }
       fsm.forceIdle()
       void drain()
     }
@@ -408,6 +421,7 @@ const drain = async () => {
   if (next.web_session_id) origin.web_session_id = next.web_session_id
   lastInbound.set(next.chat_id, origin)
   fsm.onSent()
+  inflight = next // cleared on first real activity (pretool/stop); re-queued if the turn never starts
   turnStartMs = Date.now()
   const inMeta: Record<string, unknown> = { chat_id: next.chat_id, user_id: next.user_id }
   if (next.channel === 'telegram') inMeta.tg_message_id = next.message_id
@@ -562,6 +576,7 @@ const onTelegramMessage = async (msg: {
     stopTyping()
     awaitingUserTool = null
     clearAwaitingModal(true)
+    inflight = null // operator interrupted ⇒ don't re-queue the in-flight message
     await tmux.sendEscape().catch(() => {})
     await endTurn('done')
     fsm.forceIdle()
@@ -580,6 +595,7 @@ const onTelegramMessage = async (msg: {
     stopTyping()
     awaitingUserTool = null
     clearAwaitingModal(true)
+    inflight = null // hard reset wipes all pending state
     await endTurnAndDelete()
     while (queue.shift()) { /* drain pending */ }
     fsm.forceIdle()
@@ -745,6 +761,7 @@ const server = await startHttpServer({
   },
   onStop: async (body) => {
     const { assistant_message } = await handleStopHook(body as { transcript_path?: string })
+    inflight = null // the turn produced a reply ⇒ it genuinely ran; no re-queue needed
     log.info('stop hook', { msg_len: assistant_message.length, chat: Array.from(lastInbound.keys()).pop() })
     const { text, reactions, buttons, files } = parseReply(assistant_message)
     const targetChat = Array.from(lastInbound.keys()).pop()
@@ -883,6 +900,7 @@ const server = await startHttpServer({
       active.tracker.onTaskStart(toolArgs)
       scheduleEdit(active)
     }
+    inflight = null // a tool fired ⇒ the turn genuinely started; no re-queue needed
     const inv = { tool: toolName, args: toolArgs }
     log.info('pretool', { tool: toolName, relay: needsRelay(inv, policy) })
     if (!needsRelay(inv, policy)) {
