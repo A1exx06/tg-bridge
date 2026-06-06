@@ -286,6 +286,7 @@ const armBusyTimer = (): void => {
       log.warn('busy timeout (no activity), forcing IDLE')
       stopPaneWatcher()
       stopMirror()
+      stopTyping()
       void endTurn('done')
       // No activity at all this turn ⇒ the send-keys was swallowed (TUI was
       // busy/wedged). Re-queue the in-flight message so it isn't lost.
