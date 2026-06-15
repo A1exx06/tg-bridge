@@ -1,6 +1,7 @@
 import { Bot, InputFile } from 'grammy'
 import type { ReactionTypeEmoji } from '@grammyjs/types'
 import { chunkForTelegram } from '../reply/sender.js'
+import { createSendGovernor } from './send-governor.js'
 import type { Logger } from '../log.js'
 import { extname } from 'path'
 
@@ -42,6 +43,7 @@ function decorateLabel(label: string): string {
 export interface BotWrapper {
   raw: Bot
   sendText(chatId: number, text: string, replyToMessageId?: number): Promise<void>
+  sendRich(chatId: number, markdown: string): Promise<boolean>
   sendButtons(chatId: number, text: string, buttons: BotButton[]): Promise<void>
   clearButtons(chatId: number, messageId: number): Promise<void>
   sendHtml(chatId: number, html: string): Promise<number | null>
@@ -64,6 +66,12 @@ const EMOJI_MAP: Record<string, string> = {
 export function createBot(token: string, log: Logger): BotWrapper {
   const bot = new Bot(token)
 
+  // Per-chat outbound governor: paces sends (~1/sec/chat) and honors 429
+  // retry_after so a chatty agent can't trip Telegram flood-control or hammer
+  // the API. Wraps every send/edit; non-chat methods pass through.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  bot.api.config.use(createSendGovernor(log) as any)
+
   return {
     raw: bot,
     async sendText(chatId, text, replyToMessageId) {
@@ -75,6 +83,27 @@ export function createBot(token: string, log: Logger): BotWrapper {
             ? { reply_parameters: { message_id: replyToMessageId } }
             : {},
         ).catch(err => log.warn('sendMessage failed', { error: String(err) }))
+      }
+    },
+    // Rich message (Bot API, added 2026-06-11): sends the agent's raw markdown
+    // via sendRichMessage so headings/tables/lists/quotes render natively, up to
+    // 32768 chars (no 4000-char chunking, no HTML downgrade). Direct fetch because
+    // grammY's typed RawApi may not yet expose the method. Returns false on any
+    // failure so the caller can fall back to the proven parse_mode='HTML' path.
+    async sendRich(chatId, markdown) {
+      try {
+        const res = await fetch(`https://api.telegram.org/bot${token}/sendRichMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, rich_message: { markdown } }),
+        })
+        const body = await res.json().catch(() => ({})) as { ok?: boolean; description?: string }
+        if (res.ok && body.ok) return true
+        log.warn('sendRich not delivered, falling back', { status: res.status, desc: body.description })
+        return false
+      } catch (err) {
+        log.warn('sendRich failed, falling back', { error: String(err) })
+        return false
       }
     },
     async sendButtons(chatId, text, buttons) {

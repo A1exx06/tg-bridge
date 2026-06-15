@@ -781,9 +781,15 @@ const server = await startHttpServer({
         if (buttons.length > 0) {
           await bot.sendButtons(targetChat, text, buttons)
         } else {
-          const html = formatReplyHtml(text)
-          const sent = await bot.sendHtml(targetChat, html)
-          if (sent === null) await bot.sendText(targetChat, text)
+          // Rich-first: send raw markdown via sendRichMessage (native headings/
+          // tables/lists, 32768-char limit). Fall back to the proven HTML path
+          // (then plain chunked) if the rich method is unavailable or errors.
+          const okRich = await bot.sendRich(targetChat, text)
+          if (!okRich) {
+            const html = formatReplyHtml(text)
+            const sent = await bot.sendHtml(targetChat, html)
+            if (sent === null) await bot.sendText(targetChat, text)
+          }
         }
       }
       for (const f of files) {
