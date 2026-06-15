@@ -540,6 +540,11 @@ const transcribeIfVoice = async (msg: {
   }
 }
 
+// Yes/no words that resolve a pending permission prompt when typed as text
+// (inline Allow/Deny buttons don't render on some clients — see relay.ts).
+const PERM_YES_RE = /^(да|ага|ок|окей|yes|y|ok|allow|разреш\w*|давай|можно|подтверждаю|\+)$/i
+const PERM_NO_RE = /^(нет|не|no|n|deny|запрет\w*|отмена|стоп|нельзя|-)$/i
+
 const onTelegramMessage = async (msg: {
   from?: { id: number; username?: string; first_name?: string }
   chat: { id: number }
@@ -609,6 +614,23 @@ const onTelegramMessage = async (msg: {
       await bot.sendHtml(msg.chat.id, "⚠️ ошибка рестарта: " + escapeHtml(String(err)))
     }
     return
+  }
+  // Text-reply to a pending permission prompt. When the relay is blocking on a
+  // verdict, the agent is mid-tool-call (FSM BUSY) and a normal queue.push would
+  // never drain — so a bare "да"/"нет" here is the answer to that prompt, not a
+  // new instruction. Only the gated owner reaches this (gate checked above).
+  if (relay.pendingCount() > 0) {
+    const t = (msg.text ?? '').trim()
+    if (PERM_YES_RE.test(t)) {
+      relay.answerLatest('allow')
+      void bot.setReaction(msg.chat.id, msg.message_id, 'check').catch(() => {})
+      return
+    }
+    if (PERM_NO_RE.test(t)) {
+      relay.answerLatest('deny')
+      void bot.setReaction(msg.chat.id, msg.message_id, 'cross').catch(() => {})
+      return
+    }
   }
   let text = msg.text ?? msg.caption ?? ''
   const savedPath = await saveIfFile(msg)
