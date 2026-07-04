@@ -97,6 +97,7 @@ const tmux = createTmuxSession({
   socket: cfg.claude.tmux_socket,
   session: cfg.claude.tmux_session,
   cwd: cfg.claude.workspace,
+  secretDir: cfg.paths.state_dir,
   buildCommand: () =>
     buildClaudeCommand({
       binary: cfg.claude.binary,
@@ -340,6 +341,12 @@ let mirrorChat: number | null = null
 let mirrorLastBody = ''
 let mirrorLastChangeMs = 0
 let mirrorLastSentHtml = ''
+// Bumped by every stopMirror()/startMirror(). A mirror message is created with
+// an async send; if stopMirror runs while that send is still in flight, the
+// message is born AFTER its delete already ran and would hang forever. The tick
+// captures the generation before sending and, if it changed by the time the id
+// comes back, deletes its own orphan instead of leaking it.
+let mirrorGen = 0
 // When the current turn started — drives the "working — Ns" header on the mirror.
 let turnStartMs = 0
 
@@ -366,7 +373,9 @@ const formatMirror = (pane: string, stale: boolean, elapsedSec: number): string 
 }
 
 const renderMirrorTick = async (): Promise<void> => {
-  if (mirrorChat === null) return
+  const chat = mirrorChat
+  if (chat === null) return
+  const gen = mirrorGen
   let pane: string
   try { pane = await tmux.capturePane() } catch { return }
   const bodyKey = pane.replace(/[ \t]+$/gm, '')
@@ -378,9 +387,16 @@ const renderMirrorTick = async (): Promise<void> => {
   if (html === mirrorLastSentHtml) return
   try {
     if (mirrorMsgId === null) {
-      mirrorMsgId = await bot.sendHtml(mirrorChat, html)
+      const id = await bot.sendHtml(chat, html)
+      // Race guard: the mirror was stopped while this send was in flight. The
+      // just-created message is an orphan stopMirror could not see — delete it.
+      if (gen !== mirrorGen || mirrorChat === null) {
+        if (id !== null) void bot.deleteMessage(chat, id).catch(() => {})
+        return
+      }
+      mirrorMsgId = id
     } else {
-      await bot.editHtml(mirrorChat, mirrorMsgId, html)
+      await bot.editHtml(chat, mirrorMsgId, html)
     }
     mirrorLastSentHtml = html
   } catch (err) {
@@ -403,6 +419,7 @@ const startMirror = (chatId: number): void => {
 }
 
 function stopMirror(): void {
+  mirrorGen++ // invalidate any in-flight tick so a late send deletes its own orphan
   if (mirrorStartTimer) { clearTimeout(mirrorStartTimer); mirrorStartTimer = null }
   if (mirrorTimer) { clearInterval(mirrorTimer); mirrorTimer = null }
   const chat = mirrorChat
@@ -545,6 +562,41 @@ const transcribeIfVoice = async (msg: {
 const PERM_YES_RE = /^(да|ага|ок|окей|yes|y|ok|allow|разреш\w*|давай|можно|подтверждаю|\+)$/i
 const PERM_NO_RE = /^(нет|не|no|n|deny|запрет\w*|отмена|стоп|нельзя|-)$/i
 
+// True when the message was forwarded into the chat (any Telegram variant).
+const isForwarded = (m: {
+  forward_origin?: unknown; forward_from?: unknown
+  forward_from_chat?: unknown; forward_sender_name?: unknown
+}): boolean =>
+  !!(m.forward_origin || m.forward_from || m.forward_from_chat || m.forward_sender_name)
+
+// Human label of the original author of a forwarded message, or null if hidden.
+const forwardOriginLabel = (m: {
+  forward_origin?: {
+    type: string
+    sender_user?: { first_name?: string; username?: string }
+    sender_user_name?: string
+    sender_chat?: { title?: string; username?: string }
+    chat?: { title?: string; username?: string }
+  }
+  forward_from?: { first_name?: string; username?: string }
+  forward_from_chat?: { title?: string; username?: string }
+  forward_sender_name?: string
+}): string | null => {
+  const o = m.forward_origin
+  if (o) {
+    if (o.type === 'user' && o.sender_user)
+      return o.sender_user.first_name ?? o.sender_user.username ?? 'пользователь'
+    if (o.type === 'hidden_user') return o.sender_user_name ?? 'скрытый пользователь'
+    if (o.type === 'channel' && o.chat) return o.chat.title ?? o.chat.username ?? 'канал'
+    if (o.type === 'chat' && o.sender_chat)
+      return o.sender_chat.title ?? o.sender_chat.username ?? 'чат'
+  }
+  if (m.forward_from) return m.forward_from.first_name ?? m.forward_from.username ?? 'пользователь'
+  if (m.forward_from_chat) return m.forward_from_chat.title ?? m.forward_from_chat.username ?? 'чат'
+  if (m.forward_sender_name) return m.forward_sender_name
+  return null
+}
+
 const onTelegramMessage = async (msg: {
   from?: { id: number; username?: string; first_name?: string }
   chat: { id: number }
@@ -555,6 +607,21 @@ const onTelegramMessage = async (msg: {
   document?: { file_id: string; file_name?: string }
   photo?: Array<{ file_id: string; file_size?: number }>
   video?: { file_id: string; file_name?: string }
+  // Forwarded-message markers. grammY delivers these on the raw message object;
+  // forward_origin is the modern (Bot API 7.0+) shape, the rest are legacy
+  // fields still sent for backward compat. The bridge reads them so a forward
+  // is presented to the agent as "Alexander handed you this", not as a stray
+  // line from a third party that the agent shrugs off.
+  forward_origin?: {
+    type: string
+    sender_user?: { first_name?: string; username?: string }
+    sender_user_name?: string
+    sender_chat?: { title?: string; username?: string }
+    chat?: { title?: string; username?: string }
+  }
+  forward_from?: { first_name?: string; username?: string }
+  forward_from_chat?: { title?: string; username?: string }
+  forward_sender_name?: string
   message_id: number
 }) => {
   if (!msg.from) return
@@ -643,6 +710,11 @@ const onTelegramMessage = async (msg: {
     if (transcript) text = transcript
   }
   if (!text) return
+  if (isForwarded(msg)) {
+    const origin = forwardOriginLabel(msg)
+    const src = origin ? ` (исходный автор: ${origin})` : ''
+    text = `[Александр переслал тебе это сообщение${src}. Это ввод от Александра — прочитай и обработай/ответь по сути, не считай чужой перепиской и не пропускай.]\n\n${text}`
+  }
   if (cfg.features.inject_sender_identity) {
     text = injectSenderPrefix({
       text,
@@ -972,6 +1044,21 @@ await bot.start(async (update) => {
       message?: { chat: { id: number }; message_id: number }
     }
   }
+  // DIAG-FORWARD-20260620: temporary raw-update probe. Logs the shape of every
+  // update so we can see whether a forwarded message reaches the bridge at all
+  // and which fields it carries. Remove once forward handling is confirmed.
+  try {
+    const raw = update as Record<string, unknown>
+    const m = raw.message as Record<string, unknown> | undefined
+    log.info('DIAG raw update', {
+      update_keys: Object.keys(raw),
+      has_message: !!m,
+      msg_keys: m ? Object.keys(m) : null,
+      text_len: m ? String((m.text ?? m.caption ?? '')).length : 0,
+      from_id: m ? (m.from as { id?: number } | undefined)?.id : null,
+      chat_id: m ? (m.chat as { id?: number } | undefined)?.id : null,
+    })
+  } catch { /* never let diag break the handler */ }
   if (u.message) await onTelegramMessage(u.message)
   if (u.callback_query?.data) {
     const data = u.callback_query.data

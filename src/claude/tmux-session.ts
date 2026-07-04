@@ -1,3 +1,6 @@
+import { writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+
 const TMUX = '/usr/bin/tmux'
 
 export interface TmuxSessionOpts {
@@ -8,6 +11,11 @@ export interface TmuxSessionOpts {
   // current on-disk transcript state (first boot → --session-id, respawn after
   // a transcript exists → --resume). See session-id.ts:buildClaudeCommand.
   buildCommand: () => string
+  // Private dir for the 0600 secret-env file (state_dir). When set AND
+  // CLAUDE_CODE_OAUTH_TOKEN is present, the token is passed via a sourced file
+  // instead of an inline `TOKEN=… claude` prefix — the inline form leaks the
+  // token to every local user through `ps aux` / tmux server cmdline.
+  secretDir?: string
 }
 
 export interface TmuxSession {
@@ -30,6 +38,27 @@ async function run(args: string[]): Promise<{ ok: boolean; stdout: string; stder
 
 export function createTmuxSession(opts: TmuxSessionOpts): TmuxSession {
   const baseArgs = ['-L', opts.socket]
+  // Inject a long-lived auth token into the Claude command. tmux's session env
+  // (-e) is NOT inherited by the new-session initial command, and tmux-server
+  // env inheritance is fragile (the daemon caches env from its first client).
+  // The old inline `TOKEN=… claude` prefix leaked the token to every local
+  // user via `ps aux`, so with a secretDir we write a 0600 env file and source
+  // it inside the spawned shell — only the file PATH is visible in cmdline.
+  // Fallback (no secretDir): the legacy inline prefix, so nothing breaks.
+  const tokenEnv = process.env.CLAUDE_CODE_OAUTH_TOKEN
+  const writeSecretEnv = (): string => {
+    const p = join(opts.secretDir!, 'claude-secret.env')
+    writeFileSync(p, `CLAUDE_CODE_OAUTH_TOKEN=${tokenEnv}\n`, { mode: 0o600 })
+    return p
+  }
+  const shQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`
+  const buildCmd = (): string => {
+    const cmd = opts.buildCommand()
+    if (!tokenEnv) return cmd
+    if (!opts.secretDir) return `CLAUDE_CODE_OAUTH_TOKEN=${tokenEnv} ${cmd}`
+    const envFile = writeSecretEnv()
+    return `sh -c ${shQuote(`set -a; . ${envFile}; set +a; exec ${cmd}`)}`
+  }
   return {
     async exists() {
       const r = await run([...baseArgs, 'has-session', '-t', opts.session])
@@ -40,7 +69,7 @@ export function createTmuxSession(opts: TmuxSessionOpts): TmuxSession {
       if (r.ok) return
       const r2 = await run([
         ...baseArgs, 'new-session', '-d', '-s', opts.session,
-        '-c', opts.cwd, opts.buildCommand(),
+        '-c', opts.cwd, buildCmd(),
       ])
       if (!r2.ok) throw new Error(`tmux new-session failed: ${r2.stderr}`)
     },
@@ -50,6 +79,29 @@ export function createTmuxSession(opts: TmuxSessionOpts): TmuxSession {
       await new Promise((resolve) => setTimeout(resolve, 150))
       const r2 = await run([...baseArgs, 'send-keys', '-t', opts.session, 'Enter'])
       if (!r2.ok) throw new Error(`tmux send-keys (Enter) failed: ${r2.stderr}`)
+      // Enter-verify: while Claude is busy, the TUI sometimes swallows the
+      // submit — the text stays parked in the input box and the message never
+      // reaches the model (observed 4× on 2026-07-04). Detect the leftover by
+      // looking for the tail of what we just typed in the pane's last lines and
+      // re-press Enter. Retrying ONLY on a confirmed leftover keeps this safe:
+      // no stray Enter into an empty input, a modal, or someone else's dialog.
+      const tail = text.split('\n').pop()?.trim().slice(-32) ?? ''
+      if (tail.length < 8) return // too short to match reliably — skip verify
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 600))
+        let pane = ''
+        try {
+          const cap = await run([...baseArgs, 'capture-pane', '-t', opts.session, '-p'])
+          if (!cap.ok) return
+          pane = cap.stdout
+        } catch {
+          return
+        }
+        const lastLines = pane.trimEnd().split('\n').slice(-8)
+        const stuck = lastLines.some((l) => l.includes('>') && l.includes(tail))
+        if (!stuck) return
+        await run([...baseArgs, 'send-keys', '-t', opts.session, 'Enter'])
+      }
     },
     async sendEscape() {
       // Soft interrupt — only works while Claude's input loop is responsive.
@@ -63,7 +115,7 @@ export function createTmuxSession(opts: TmuxSessionOpts): TmuxSession {
       await new Promise((resolve) => setTimeout(resolve, 300))
       const r = await run([
         ...baseArgs, 'new-session', '-d', '-s', opts.session,
-        '-c', opts.cwd, opts.buildCommand(),
+        '-c', opts.cwd, buildCmd(),
       ])
       if (!r.ok) throw new Error(`tmux new-session (restart) failed: ${r.stderr}`)
     },
