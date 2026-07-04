@@ -99,6 +99,11 @@ const tmux = createTmuxSession({
   session: cfg.claude.tmux_session,
   cwd: cfg.claude.workspace,
   secretDir: cfg.paths.state_dir,
+  // Inbox-channel opt-in (INPUT_CHANNEL=inbox). Unset → legacy send-keys.
+  inboxDir:
+    cfg.claude.input_channel === 'inbox'
+      ? join(cfg.paths.state_dir, 'inbox')
+      : undefined,
   buildCommand: () =>
     buildClaudeCommand({
       binary: cfg.claude.binary,

@@ -24,6 +24,11 @@ const EnvSchema = z.object({
   TMUX_SESSION: z.string().min(1),
   CLAUDE_BINARY: z.string().min(1),
   CLAUDE_FLAGS: z.string().default('--dangerously-skip-permissions'),
+  // Input path: 'sendkeys' drives the pane from outside with `tmux
+  // send-keys` (legacy, default). 'inbox' persists each message and lets an
+  // in-session watcher inject it (feature/inbox-channel, plan B). Per-agent
+  // opt-in for a staged cutover; the fleet stays on sendkeys until flipped.
+  INPUT_CHANNEL: z.enum(['sendkeys', 'inbox']).default('sendkeys'),
   WORKSPACE: z.string().min(1),
   STATE_DIR: z.string().min(1),
   LOG_DIR: z.string().min(1),
@@ -68,6 +73,7 @@ export interface AppConfig {
     workspace: string
     tmux_socket: string
     tmux_session: string
+    input_channel: 'sendkeys' | 'inbox'
   }
   features: {
     business_api: boolean
@@ -113,6 +119,7 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
       workspace: parsed.WORKSPACE,
       tmux_socket: parsed.TMUX_SOCKET,
       tmux_session: parsed.TMUX_SESSION,
+      input_channel: parsed.INPUT_CHANNEL,
     },
     features: {
       business_api: parsed.BUSINESS_API_ENABLED,

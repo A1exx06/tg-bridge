@@ -1,7 +1,23 @@
-import { writeFileSync } from 'node:fs'
+import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
 
 const TMUX = '/usr/bin/tmux'
+
+// writeToInbox — persist an inbound message as an inbox JSON the in-session
+// watcher (chat-entrypoint.sh) will inject. Atomicity: write a dotfile .tmp
+// sibling and rename() into place, so the watcher (globbing *.json) never
+// observes a half-written file. This is the inbox-channel replacement for
+// the external `tmux send-keys` path — the message survives on disk until
+// the watcher confirms submit, so a swallowed Enter can never lose it.
+function writeToInbox(dir: string, text: string): void {
+  mkdirSync(dir, { recursive: true })
+  const id = `${Date.now()}-${randomUUID().slice(0, 8)}`
+  const tmp = join(dir, `.${id}.json.tmp`)
+  const final = join(dir, `${id}.json`)
+  writeFileSync(tmp, JSON.stringify({ text }), { mode: 0o600 })
+  renameSync(tmp, final)
+}
 
 export interface TmuxSessionOpts {
   socket: string
@@ -16,6 +32,17 @@ export interface TmuxSessionOpts {
   // instead of an inline `TOKEN=… claude` prefix — the inline form leaks the
   // token to every local user through `ps aux` / tmux server cmdline.
   secretDir?: string
+  // Inbox-channel input path (feature/inbox-channel, plan B). When set:
+  //   * the session launches claude THROUGH chat-entrypoint.sh, whose
+  //     in-pane watcher drains this directory and injects messages via
+  //     bracketed paste + verified Enter (readiness-gated, persistent);
+  //   * sendKeys() writes an inbox JSON here instead of driving the pane
+  //     from outside with `tmux send-keys`.
+  // Unset (default) keeps the legacy external send-keys path verbatim, so
+  // the existing fleet is untouched until each agent opts in. Explicit
+  // `| undefined` so server.ts can pass the conditional result directly
+  // under exactOptionalPropertyTypes.
+  inboxDir?: string | undefined
 }
 
 export interface TmuxSession {
@@ -52,8 +79,17 @@ export function createTmuxSession(opts: TmuxSessionOpts): TmuxSession {
     return p
   }
   const shQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`
+  // In inbox mode, run the claude command THROUGH the watcher entrypoint,
+  // exposing the inbox dir. The token (when present) is already in the
+  // environment by the time the entrypoint exec's claude, so nothing about
+  // the token handling below changes.
+  const entrypointPath = join(import.meta.dir, 'chat-entrypoint.sh')
+  const inboxWrap = (claudeCmd: string): string => {
+    if (!opts.inboxDir) return claudeCmd
+    return `env CHAT_INBOX_DIR=${shQuote(opts.inboxDir)} bash ${shQuote(entrypointPath)} ${claudeCmd}`
+  }
   const buildCmd = (): string => {
-    const cmd = opts.buildCommand()
+    const cmd = inboxWrap(opts.buildCommand())
     if (!tokenEnv) return cmd
     if (!opts.secretDir) return `CLAUDE_CODE_OAUTH_TOKEN=${tokenEnv} ${cmd}`
     const envFile = writeSecretEnv()
@@ -74,6 +110,13 @@ export function createTmuxSession(opts: TmuxSessionOpts): TmuxSession {
       if (!r2.ok) throw new Error(`tmux new-session failed: ${r2.stderr}`)
     },
     async sendKeys(text) {
+      // Inbox-channel mode: persist the message; the in-session watcher
+      // injects it (readiness-gated bracketed paste + verified Enter). No
+      // external send-keys — the grabli this whole path exists to kill.
+      if (opts.inboxDir) {
+        writeToInbox(opts.inboxDir, text)
+        return
+      }
       const r1 = await run([...baseArgs, 'send-keys', '-t', opts.session, '-l', text])
       if (!r1.ok) throw new Error(`tmux send-keys (text) failed: ${r1.stderr}`)
       await new Promise((resolve) => setTimeout(resolve, 150))
