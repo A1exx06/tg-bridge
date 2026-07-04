@@ -12,6 +12,7 @@ import { injectSenderPrefix } from './persona/sender-prefix.js'
 import { parseReply } from './reply/parser.js'
 import { routeFile } from './reply/file-route.js'
 import { formatReplyHtml } from './reply/markdown.js'
+import { redactOutbound } from './reply/redact-outbound.js'
 import { startHttpServer } from './hooks/http-server.js'
 import { handleStopHook } from './hooks/stop.js'
 import { ProgressTracker } from './progress/tracker.js'
@@ -353,7 +354,10 @@ let turnStartMs = 0
 const MIRROR_HARD_CAP = 3500
 const MIRROR_STALE_MS = 90000
 
-const formatMirror = (pane: string, stale: boolean, elapsedSec: number): string => {
+const formatMirror = (paneRaw: string, stale: boolean, elapsedSec: number): string => {
+  // The pane can show `export FOO_TOKEN=…`, ps output, curl -H "Authorization: …"
+  // — mask unambiguous credentials before the capture leaves the host.
+  const pane = redactOutbound(paneRaw)
   let lines = pane.split('\n').map((l) => l.replace(/[ \t]+$/, ''))
   while (lines.length && lines[lines.length - 1] === '') lines.pop()
   while (lines.length && lines[0] === '') lines.shift()
@@ -872,17 +876,20 @@ const server = await startHttpServer({
       // Hybrid send-to-Telegram: always (originChannel='web' linked mode keeps
       // the operator's TG chat in the loop). DB-mirror happens below.
       if (text.length > 0) {
+        // Precision credential masking (bot tokens, sk-/ghp_/JWT/Bearer …) —
+        // NOT the broad progress-mask: full addresses/IPs/urls must survive.
+        const safeText = redactOutbound(text)
         if (buttons.length > 0) {
-          await bot.sendButtons(targetChat, text, buttons)
+          await bot.sendButtons(targetChat, safeText, buttons)
         } else {
           // Rich-first: send raw markdown via sendRichMessage (native headings/
           // tables/lists, 32768-char limit). Fall back to the proven HTML path
           // (then plain chunked) if the rich method is unavailable or errors.
-          const okRich = await bot.sendRich(targetChat, text)
+          const okRich = await bot.sendRich(targetChat, safeText)
           if (!okRich) {
-            const html = formatReplyHtml(text)
+            const html = formatReplyHtml(safeText)
             const sent = await bot.sendHtml(targetChat, html)
-            if (sent === null) await bot.sendText(targetChat, text)
+            if (sent === null) await bot.sendText(targetChat, safeText)
           }
         }
       }
