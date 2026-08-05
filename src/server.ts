@@ -762,6 +762,19 @@ const ownerChatId =
   cfg.telegram.allowed_user_ids[0] ??
   0
 
+// The outbound reply must reach the human operator's Telegram chat. Swarm
+// pushes (agent-to-agent) are enqueued for context but carry their own chat_id
+// — often a stale/legacy owner id — and would otherwise become the last key in
+// `lastInbound`, hijacking the reply target and causing "chat not found".
+// Pick the most recent NON-swarm inbound; fall back to the owner chat.
+const resolveReplyTarget = (): { chat: number | undefined; origin: InboundOrigin | undefined } => {
+  const human = Array.from(lastInbound.entries())
+    .filter(([, o]) => (o.channel ?? 'telegram') !== 'swarm')
+    .pop()
+  if (human) return { chat: human[0], origin: human[1] }
+  return { chat: ownerChatId || undefined, origin: undefined }
+}
+
 const relay = createRelay({
   sendPrompt: async (chatId, text, reqId) => {
     await bot.raw.api.sendMessage(chatId, text, {
@@ -866,10 +879,9 @@ const server = await startHttpServer({
   onStop: async (body) => {
     const { assistant_message } = await handleStopHook(body as { transcript_path?: string })
     inflight = null // the turn produced a reply ⇒ it genuinely ran; no re-queue needed
-    log.info('stop hook', { msg_len: assistant_message.length, chat: Array.from(lastInbound.keys()).pop() })
+    const { chat: targetChat, origin } = resolveReplyTarget()
+    log.info('stop hook', { msg_len: assistant_message.length, chat: targetChat })
     const { text, reactions, buttons, files } = parseReply(assistant_message)
-    const targetChat = Array.from(lastInbound.keys()).pop()
-    const origin = targetChat !== undefined ? lastInbound.get(targetChat) : undefined
     const targetMsg = origin?.message_id
     const originChannel: QueueChannel = origin?.channel ?? 'telegram'
     disarmBusyTimer()
@@ -890,7 +902,10 @@ const server = await startHttpServer({
           // Rich-first: send raw markdown via sendRichMessage (native headings/
           // tables/lists, 32768-char limit). Fall back to the proven HTML path
           // (then plain chunked) if the rich method is unavailable or errors.
-          const okRich = await bot.sendRich(targetChat, safeText)
+          // RICH_MESSAGES=off skips rich entirely so text stays copyable.
+          const okRich = cfg.features.rich_messages
+            ? await bot.sendRich(targetChat, safeText)
+            : false
           if (!okRich) {
             const html = formatReplyHtml(safeText)
             const sent = await bot.sendHtml(targetChat, html)
@@ -980,8 +995,7 @@ const server = await startHttpServer({
       disarmBusyTimer()
       stopPaneWatcher()
       log.info('awaiting user input — heartbeat frozen', { tool: toolName })
-      const surfaceChat = Array.from(lastInbound.keys()).pop()
-        ?? cfg.features.owner_user_ids[0]
+      const surfaceChat = resolveReplyTarget().chat
       if (surfaceChat !== undefined) {
         void (async () => {
           try {
