@@ -3,7 +3,14 @@ import type { ReactionTypeEmoji } from '@grammyjs/types'
 import { chunkForTelegram } from '../reply/sender.js'
 import { createSendGovernor } from './send-governor.js'
 import type { Logger } from '../log.js'
-import { extname } from 'path'
+import { extname, join } from 'path'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { tmpdir } from 'node:os'
+import { appendFileSync, mkdirSync, unlinkSync } from 'fs'
+import { createHash } from 'node:crypto'
+
+const execFileP = promisify(execFile)
 
 const PHOTO_EXT = new Set(['.jpg', '.jpeg', '.png', '.webp'])
 const VIDEO_EXT = new Set(['.mp4', '.mov', '.webm'])
@@ -84,8 +91,113 @@ const timedFetch = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => 
   return fetch(input, { ...init, signal })
 }) as typeof fetch
 
-export function createBot(token: string, log: Logger): BotWrapper {
+// ── M4-lite reliable outbound (ported from dashi-plugin M4, 2026-08-13) ──
+// A failed send is only safely retryable when Telegram provably never saw it:
+// connection-phase failures (refused / DNS). Anything else — reset, abort,
+// 5xx — MAY have landed, and retrying a sendMessage there risks duplicates.
+// Policy: retry pre_send up to 2 times (1s/5s), everything else fails once,
+// loudly; every terminal failure is appended to a dead-letter JSONL so a lost
+// reply is a record, not a silent hole (the 2026-08-13 outage failure mode).
+const PRE_SEND_PATTERNS = /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ConnectionRefused|Unable to connect/i
+const RETRY_DELAYS_MS = [1_000, 5_000]
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+// Video metadata for outbound sends. Best-effort: a missing ffprobe/ffmpeg or
+// an odd container degrades to the old metadata-less send, never to a failure.
+async function probeVideo(
+  path: string,
+  log: Logger,
+): Promise<{ duration?: number; width?: number; height?: number; thumbPath?: string }> {
+  try {
+    const { stdout } = await execFileP('ffprobe', [
+      '-v', 'error',
+      '-select_streams', 'v:0',
+      '-show_entries', 'stream=width,height:format=duration',
+      '-of', 'json',
+      path,
+    ])
+    const parsed = JSON.parse(stdout) as {
+      streams?: Array<{ width?: number; height?: number }>
+      format?: { duration?: string }
+    }
+    const width = parsed.streams?.[0]?.width
+    const height = parsed.streams?.[0]?.height
+    const durationRaw = Number(parsed.format?.duration)
+    const duration = Number.isFinite(durationRaw) && durationRaw > 0 ? Math.round(durationRaw) : undefined
+    let thumbPath: string | undefined = join(tmpdir(), `tg-thumb-${process.pid}-${Date.now()}.jpg`)
+    try {
+      // -ss after the start for a non-black frame; ≤320px per Bot API limits.
+      const seek = duration !== undefined && duration < 2 ? '0' : '1'
+      await execFileP('ffmpeg', ['-y', '-ss', seek, '-i', path, '-frames:v', '1', '-vf', 'scale=320:-2', thumbPath])
+    } catch {
+      thumbPath = undefined
+    }
+    const out: { duration?: number; width?: number; height?: number; thumbPath?: string } = {}
+    if (duration !== undefined) out.duration = duration
+    if (width !== undefined) out.width = width
+    if (height !== undefined) out.height = height
+    if (thumbPath !== undefined) out.thumbPath = thumbPath
+    return out
+  } catch (err) {
+    log.warn('video probe failed, sending without metadata', { error: String(err) })
+    return {}
+  }
+}
+
+export function createBot(
+  token: string,
+  log: Logger,
+  opts?: { deadLetterDir?: string },
+): BotWrapper {
   const bot = new Bot(token, { client: { fetch: timedFetch } })
+
+  const deadLetter = (method: string, chatId: number | string, payloadDesc: string, error: string): void => {
+    if (!opts?.deadLetterDir) return
+    try {
+      mkdirSync(opts.deadLetterDir, { recursive: true })
+      appendFileSync(
+        join(opts.deadLetterDir, 'outbound-dead-letter.jsonl'),
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          method,
+          chat_id: chatId,
+          // Hash, not payload: dead-letter must never become a secrets sink.
+          payload_sha256: createHash('sha256').update(payloadDesc).digest('hex'),
+          error,
+        }) + '\n',
+      )
+    } catch (dlErr) {
+      log.warn('dead-letter write failed', { error: String(dlErr) })
+    }
+  }
+
+  const sendReliably = async (
+    method: string,
+    chatId: number | string,
+    payloadDesc: string,
+    fn: () => Promise<unknown>,
+  ): Promise<boolean> => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await fn()
+        return true
+      } catch (err) {
+        const msg = String(err)
+        const preSend = PRE_SEND_PATTERNS.test(msg)
+        if (preSend && attempt < RETRY_DELAYS_MS.length) {
+          log.warn(`${method} pre-send failure, retrying`, { attempt: attempt + 1, error: msg })
+          await sleepMs(RETRY_DELAYS_MS[attempt] ?? 5_000)
+          continue
+        }
+        log.error(`${method} failed${preSend ? ' after retries' : ''} — dead-lettered`, { error: msg })
+        deadLetter(method, chatId, payloadDesc, msg)
+        return false
+      }
+    }
+  }
 
   // Per-chat outbound governor: paces sends (~1/sec/chat) and honors 429
   // retry_after so a chatty agent can't trip Telegram flood-control or hammer
@@ -97,13 +209,14 @@ export function createBot(token: string, log: Logger): BotWrapper {
     raw: bot,
     async sendText(chatId, text, replyToMessageId) {
       for (const chunk of chunkForTelegram(text)) {
-        await bot.api.sendMessage(
-          chatId,
-          chunk,
-          replyToMessageId
-            ? { reply_parameters: { message_id: replyToMessageId } }
-            : {},
-        ).catch(err => log.warn('sendMessage failed', { error: String(err) }))
+        await sendReliably('sendMessage', chatId, chunk, () =>
+          bot.api.sendMessage(
+            chatId,
+            chunk,
+            replyToMessageId
+              ? { reply_parameters: { message_id: replyToMessageId } }
+              : {},
+          ))
       }
     },
     // Rich message (Bot API, added 2026-06-11): sends the agent's raw markdown
@@ -117,6 +230,9 @@ export function createBot(token: string, log: Logger): BotWrapper {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ chat_id: chatId, rich_message: { markdown } }),
+          // Direct fetch bypasses grammY's client, so it needs its own abort:
+          // during the 2026-08-13 outage this exact call sat on a dead backend.
+          signal: AbortSignal.timeout(API_CALL_TIMEOUT_MS),
         })
         const body = await res.json().catch(() => ({})) as { ok?: boolean; description?: string }
         if (res.ok && body.ok) return true
@@ -185,14 +301,33 @@ export function createBot(token: string, log: Logger): BotWrapper {
       const kind = inferKind(spec)
       const file = new InputFile(spec.path)
       const opts = spec.caption ? { caption: spec.caption } : {}
-      try {
-        if (kind === 'photo') await bot.api.sendPhoto(chatId, file, opts)
-        else if (kind === 'video') await bot.api.sendVideo(chatId, file, opts)
-        else if (kind === 'voice') await bot.api.sendVoice(chatId, file, opts)
-        else await bot.api.sendDocument(chatId, file, opts)
-      } catch (err) {
-        log.warn('sendFile failed', { error: String(err), kind, path: spec.path })
+      if (kind === 'video') {
+        // Without explicit metadata Telegram probes the mp4 itself and for
+        // some encodes yields a broken 0:00 card — unplayable and not savable
+        // to the gallery (root-fix for the long-standing [FILE:] video bug;
+        // the manual Bot API recipe proved metadata fixes it, 2026-07-12).
+        const meta = await probeVideo(spec.path, log)
+        const videoOpts: Parameters<typeof bot.api.sendVideo>[2] = {
+          ...opts,
+          supports_streaming: true,
+          ...(meta.duration !== undefined ? { duration: meta.duration } : {}),
+          ...(meta.width !== undefined ? { width: meta.width } : {}),
+          ...(meta.height !== undefined ? { height: meta.height } : {}),
+          ...(meta.thumbPath ? { thumbnail: new InputFile(meta.thumbPath) } : {}),
+        }
+        await sendReliably('sendVideo', chatId, spec.path, () =>
+          bot.api.sendVideo(chatId, file, videoOpts))
+        if (meta.thumbPath) {
+          try { unlinkSync(meta.thumbPath) } catch { /* tmp cleanup, best-effort */ }
+        }
+        return
       }
+      const methodName = `send${kind.charAt(0).toUpperCase()}${kind.slice(1)}`
+      await sendReliably(methodName, chatId, spec.path, () => {
+        if (kind === 'photo') return bot.api.sendPhoto(chatId, file, opts)
+        if (kind === 'voice') return bot.api.sendVoice(chatId, file, opts)
+        return bot.api.sendDocument(chatId, file, opts)
+      })
     },
     async setReaction(chatId, messageId, emojiSlug) {
       const emoji = EMOJI_MAP[emojiSlug]

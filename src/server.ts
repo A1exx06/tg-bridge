@@ -117,7 +117,7 @@ const tmux = createTmuxSession({
 await tmux.ensure()
 log.info('tmux session ready')
 
-const bot = createBot(cfg.telegram.bot_token, log)
+const bot = createBot(cfg.telegram.bot_token, log, { deadLetterDir: cfg.paths.log_dir })
 
 interface InboundOrigin {
   message_id: number
