@@ -28,7 +28,7 @@ import { createRelay } from './permission/relay.js'
 import { needsRelay, type Policy } from './permission/policy.js'
 import { mkdirSync, existsSync, readFileSync } from 'fs'
 import { load as loadYaml } from 'js-yaml'
-import { join } from 'path'
+import { join, dirname } from 'path'
 
 const cfg = loadConfig(process.env)
 
@@ -1118,6 +1118,70 @@ await bot.start(async (update) => {
 })
 
 log.info('bot polling started', { bot_id: cfg.telegram.bot_id })
+
+// Health watchdog (fix B, FIX-POLL-WATCHDOG-2026-08-13.md). Covers API-path
+// degradation the poller can't see from inside: getMe goes through timedFetch,
+// so a dead backend surfaces as an error within its timeout budget instead of
+// hanging. Three consecutive failures -> exit(1), systemd's Restart=on-failure
+// brings the bridge back with a fresh network stack.
+// Storm guard: during a provider-side outage measured in hours (2026-08-13 was
+// ~3h, and restarts provably don't help — the failure sits past Telegram's
+// edge) an exit every ~3 minutes is pure churn, so after 5 watchdog exits
+// inside 30 minutes the watchdog stops exiting and keeps logging until the API
+// answers again. Exit timestamps persist across restarts in the state file.
+const HEALTH_INTERVAL_MS = 60_000
+const HEALTH_EXIT_THRESHOLD = 3
+const STORM_WINDOW_MS = 30 * 60_000
+const STORM_MAX_EXITS = 5
+const healthStateFile = join(homedir(), '.local', 'state', 'tg-bridge-a2', `health-exits-${cfg.telegram.bot_id}.json`)
+
+function readHealthExits(): number[] {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(healthStateFile, 'utf8'))
+    return Array.isArray(parsed) ? parsed.filter((t): t is number => typeof t === 'number') : []
+  } catch {
+    return []
+  }
+}
+
+function writeHealthExits(ts: number[]): void {
+  try {
+    mkdirSync(dirname(healthStateFile), { recursive: true })
+    writeFileSync(healthStateFile, JSON.stringify(ts))
+  } catch (err) {
+    log.warn('health watchdog: cannot persist exit timestamps', { error: String(err) })
+  }
+}
+
+let healthFailures = 0
+setInterval(async () => {
+  try {
+    await bot.getMe()
+    if (healthFailures > 0) log.info('telegram api health recovered', { after_failures: healthFailures })
+    healthFailures = 0
+  } catch (err) {
+    healthFailures++
+    log.warn('telegram api health check failed', { n: healthFailures, error: String(err) })
+    if (healthFailures < HEALTH_EXIT_THRESHOLD) return
+    const recentExits = readHealthExits().filter((t) => Date.now() - t < STORM_WINDOW_MS)
+    if (recentExits.length >= STORM_MAX_EXITS) {
+      // Log at a low duty cycle — once per ~5 checks — so a multi-hour outage
+      // does not flood bridge.err while the guard holds the process alive.
+      if (healthFailures % 5 === 0) {
+        log.error('health watchdog: API still unreachable, storm guard active — staying up', {
+          consecutive_failures: healthFailures,
+          exits_last_30m: recentExits.length,
+        })
+      }
+      return
+    }
+    writeHealthExits([...recentExits, Date.now()])
+    log.error('health watchdog: consecutive failures reached threshold, exiting for systemd restart', {
+      consecutive_failures: healthFailures,
+    })
+    process.exit(1)
+  }
+}, HEALTH_INTERVAL_MS)
 
 const shutdown = async () => {
   log.info('shutting down')

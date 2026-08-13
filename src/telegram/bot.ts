@@ -63,8 +63,29 @@ const EMOJI_MAP: Record<string, string> = {
   ok: '👌', check: '✅', cross: '❌', warning: '⚠️',
 }
 
+// A half-open TCP connection to Telegram leaves fetch waiting forever: no
+// data, no error, so no retry logic ever runs and the bridge stays "active"
+// but deaf (incident 2026-08-13, FIX-POLL-WATCHDOG-2026-08-13.md). A hard
+// abort turns that hang into an error grammY's polling loop retries normally.
+// Budget must exceed the long-poll `timeout` (30s server-side) with slack;
+// multipart uploads (sendVideo of tens of MB on a throttled link) legitimately
+// run much longer, so non-string bodies get a wider budget.
+const API_CALL_TIMEOUT_MS = 75_000
+const UPLOAD_TIMEOUT_MS = 600_000
+
+// Cast: bun's `typeof fetch` also carries a `preconnect` helper that a plain
+// wrapper function lacks; grammY only ever calls the function itself.
+const timedFetch = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+  const isJsonCall = init?.body === undefined || typeof init.body === 'string'
+  const timeout = AbortSignal.timeout(isJsonCall ? API_CALL_TIMEOUT_MS : UPLOAD_TIMEOUT_MS)
+  const signal = init?.signal
+    ? AbortSignal.any([init.signal as AbortSignal, timeout])
+    : timeout
+  return fetch(input, { ...init, signal })
+}) as typeof fetch
+
 export function createBot(token: string, log: Logger): BotWrapper {
-  const bot = new Bot(token)
+  const bot = new Bot(token, { client: { fetch: timedFetch } })
 
   // Per-chat outbound governor: paces sends (~1/sec/chat) and honors 429
   // retry_after so a chatty agent can't trip Telegram flood-control or hammer
