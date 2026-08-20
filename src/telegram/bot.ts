@@ -7,7 +7,7 @@ import { extname, join } from 'path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { tmpdir } from 'node:os'
-import { appendFileSync, mkdirSync, unlinkSync } from 'fs'
+import { appendFileSync, mkdirSync, statSync, unlinkSync } from 'fs'
 import { createHash } from 'node:crypto'
 
 const execFileP = promisify(execFile)
@@ -100,6 +100,9 @@ const timedFetch = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => 
 // reply is a record, not a silent hole (the 2026-08-13 outage failure mode).
 const PRE_SEND_PATTERNS = /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ConnectionRefused|Unable to connect/i
 const RETRY_DELAYS_MS = [1_000, 5_000]
+
+// Bot API hard limit is 50MB; leave headroom for multipart overhead.
+const MAX_UPLOAD_BYTES = 48 * 1024 * 1024
 
 function sleepMs(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
@@ -299,6 +302,21 @@ export function createBot(
     },
     async sendFile(chatId, spec) {
       const kind = inferKind(spec)
+      // Bot API caps uploads at 50MB. A doomed oversized multipart still pumps
+      // the full file into api.telegram.org before the 413 lands; a run of
+      // those degraded this bot's gateway shard into all-504 twice (13.08 and
+      // 19.08 incidents). Never start an upload that cannot succeed.
+      const sizeBytes = statSync(spec.path).size
+      if (sizeBytes > MAX_UPLOAD_BYTES) {
+        const sizeMb = Math.round(sizeBytes / 1048576)
+        log.error('sendFile refused: over Bot API 50MB limit', { path: spec.path, size_mb: sizeMb })
+        deadLetter('sendFile', chatId, spec.path, `refused pre-flight: ${sizeMb}MB > 50MB Bot API limit`)
+        await bot.api.sendMessage(
+          chatId,
+          `Файл не отправлен: ${sizeMb}MB превышает лимит Telegram для ботов (50MB).\n${spec.path}`,
+        ).catch(() => { /* best-effort notice */ })
+        return
+      }
       const file = new InputFile(spec.path)
       const opts = spec.caption ? { caption: spec.caption } : {}
       if (kind === 'video') {
