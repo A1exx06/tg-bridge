@@ -41,6 +41,17 @@ const EnvSchema = z.object({
   BUSY_TIMEOUT_MS: z.coerce.number().int().positive().default(300000),
   LOGIN_WATCHDOG_MS: z.coerce.number().int().nonnegative().default(60000),
   STREAMING_MODE: z.enum(['off', 'partial', 'progress']).default('off'),
+  // Rich outbound rendering via sendRichMessage. Default on (native headings/
+  // tables). Set RICH_MESSAGES=off per channel to send copyable HTML/plain text
+  // instead — rich blocks render but Telegram forbids copying their text.
+  RICH_MESSAGES: z
+    .union([z.boolean(), z.string()])
+    .default(true)
+    .transform((v) => {
+      if (typeof v === 'boolean') return v
+      const s = v.trim().toLowerCase()
+      return s === 'true' || s === '1' || s === 'yes' || s === 'on'
+    }),
   MIRROR_ENABLED: z
     .union([z.boolean(), z.string()])
     .default(true)
@@ -78,6 +89,7 @@ export interface AppConfig {
   features: {
     business_api: boolean
     inject_sender_identity: boolean
+    rich_messages: boolean
     owner_user_ids: number[]
   }
   paths: { state_dir: string; log_dir: string }
@@ -124,6 +136,7 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
     features: {
       business_api: parsed.BUSINESS_API_ENABLED,
       inject_sender_identity: parsed.INJECT_SENDER_IDENTITY,
+      rich_messages: parsed.RICH_MESSAGES,
       owner_user_ids: ownerIds,
     },
     paths: { state_dir: parsed.STATE_DIR, log_dir: parsed.LOG_DIR },

@@ -493,14 +493,18 @@ const saveIfFile = async (msg: {
   document?: { file_id: string; file_name?: string }
   photo?: Array<{ file_id: string; file_size?: number }>
   video?: { file_id: string; file_name?: string }
+  audio?: { file_id: string; file_name?: string }
+  voice?: { file_id: string }
 }): Promise<string | null> => {
   const file = msg.document
     ?? msg.video
+    ?? msg.audio
+    ?? msg.voice
     ?? (msg.photo && msg.photo.length > 0 ? msg.photo[msg.photo.length - 1] : undefined)
   if (!file) return null
   try {
     const { buf, filename } = await downloadTelegramFile(cfg.telegram.bot_token, file.file_id)
-    const hint = (msg.document?.file_name ?? msg.video?.file_name ?? filename)
+    const hint = (msg.document?.file_name ?? msg.video?.file_name ?? msg.audio?.file_name ?? filename)
     const name = safeFilename(hint)
     const savePath = join(uploadsDir, `${tsPrefix()}-${name}`)
     writeFileSync(savePath, Buffer.from(buf))
@@ -606,11 +610,59 @@ const forwardOriginLabel = (m: {
   return null
 }
 
+// Bot API 10.1+ rich messages (sendRichMessage) arrive without `text`/`caption`;
+// the content lives in `rich_message.blocks`. Forwards of such messages (e.g.
+// another bot's report) used to be dropped silently. Flatten them to plain text.
+const richTextToPlain = (rt: unknown): string => {
+  if (typeof rt === 'string') return rt
+  if (Array.isArray(rt)) return rt.map(richTextToPlain).join('')
+  if (rt && typeof rt === 'object') {
+    const o = rt as Record<string, unknown>
+    if (o.text !== undefined) return richTextToPlain(o.text)
+    if (typeof o.label === 'string') return o.label
+  }
+  return ''
+}
+const richBlocksToPlain = (blocks: unknown): string => {
+  if (!Array.isArray(blocks)) return ''
+  const out: string[] = []
+  for (const b of blocks) {
+    if (!b || typeof b !== 'object') continue
+    const o = b as Record<string, unknown>
+    switch (o.type) {
+      case 'list':
+        for (const it of (Array.isArray(o.items) ? o.items : []) as Array<Record<string, unknown>>) {
+          const body = richBlocksToPlain(it.blocks)
+          out.push(`${typeof it.label === 'string' && it.label ? it.label : '-'} ${body}`.trim())
+        }
+        break
+      case 'table':
+        for (const row of (Array.isArray(o.cells) ? o.cells : []) as Array<Array<Record<string, unknown>>>) {
+          out.push(row.map((c) => richTextToPlain(c?.text)).join(' | '))
+        }
+        if (o.caption) out.push(richTextToPlain(o.caption))
+        break
+      case 'divider':
+        out.push('---')
+        break
+      default: {
+        if (o.summary) out.push(richTextToPlain(o.summary))
+        const t = richTextToPlain(o.text)
+        if (t) out.push(t)
+        if (o.blocks) out.push(richBlocksToPlain(o.blocks))
+        if (o.caption) out.push(richTextToPlain(o.caption))
+      }
+    }
+  }
+  return out.filter((x) => x.trim()).join('\n')
+}
+
 const onTelegramMessage = async (msg: {
   from?: { id: number; username?: string; first_name?: string }
   chat: { id: number }
   text?: string
   caption?: string
+  rich_message?: { blocks?: unknown[] }
   voice?: { file_id: string; duration?: number }
   audio?: { file_id: string }
   document?: { file_id: string; file_name?: string }
@@ -709,16 +761,23 @@ const onTelegramMessage = async (msg: {
     }
   }
   let text = msg.text ?? msg.caption ?? ''
+  if (!text && msg.rich_message) text = richBlocksToPlain(msg.rich_message.blocks)
   const savedPath = await saveIfFile(msg)
   if (savedPath) {
     const prefix = `Оператор прислал файл: ${savedPath}`
     text = text ? `${prefix}\n${text}` : prefix
   }
-  if (!text) {
+  // Voice/audio is both saved to disk (savedPath above) and transcribed:
+  // the transcript stays the operator's actual input, the file lets the agent
+  // work with the raw audio (music recognition, tone, re-listening).
+  if (!text || msg.voice || msg.audio) {
     const transcript = await transcribeIfVoice(msg)
-    if (transcript) text = transcript
+    if (transcript) text = text ? `${text}\n${transcript}` : transcript
   }
-  if (!text) return
+  if (!text) {
+    log.warn('inbound message dropped: no extractable text', { keys: Object.keys(msg), forwarded: isForwarded(msg) })
+    return
+  }
   if (isForwarded(msg)) {
     const origin = forwardOriginLabel(msg)
     const src = origin ? ` (исходный автор: ${origin})` : ''
@@ -1130,7 +1189,9 @@ log.info('bot polling started', { bot_id: cfg.telegram.bot_id })
 // inside 30 minutes the watchdog stops exiting and keeps logging until the API
 // answers again. Exit timestamps persist across restarts in the state file.
 const HEALTH_INTERVAL_MS = 60_000
-const HEALTH_EXIT_THRESHOLD = 3
+// Env-overridable: when Telegram is throttling THIS token, restarting only feeds the
+// throttle. Keep the process up and let it keep retrying instead of exiting.
+const HEALTH_EXIT_THRESHOLD = Number(process.env.BRIDGE_HEALTH_EXIT_THRESHOLD ?? 3)
 const STORM_WINDOW_MS = 30 * 60_000
 const STORM_MAX_EXITS = 5
 const healthStateFile = join(homedir(), '.local', 'state', 'tg-bridge-a2', `health-exits-${cfg.telegram.bot_id}.json`)
