@@ -106,3 +106,12 @@ export function buildClaudeCommand(opts: {
   const flag = resumeFlag(opts.sid, exists(tp))
   return `${opts.binary} ${opts.flags} ${flag}`.trim()
 }
+
+// Replace the persisted sid with a fresh one (operator's /new = clean context).
+// The old transcript stays on disk; the next spawn uses `--session-id <new>`.
+export function rotateSid(stateDir: string, gen: () => string = randomUUID): string {
+  const sid = gen()
+  mkdirSync(stateDir, { recursive: true })
+  writeFileSync(join(stateDir, SID_FILE), sid + '\n')
+  return sid
+}

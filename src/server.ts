@@ -5,7 +5,7 @@ import { createQueue } from './claude/queue.js'
 import { createTmuxSession } from './claude/tmux-session.js'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
-import { loadOrCreateSid, buildClaudeCommand, latestTranscriptSid } from './claude/session-id.js'
+import { loadOrCreateSid, rotateSid, buildClaudeCommand, latestTranscriptSid, transcriptPath } from './claude/session-id.js'
 import { createBot } from './telegram/bot.js'
 import { allowMessage } from './telegram/gate.js'
 import { injectSenderPrefix } from './persona/sender-prefix.js'
@@ -89,7 +89,7 @@ const queue = createQueue<QueueItem>({
 // On first run (no sid file yet) adopt the workspace's most recent transcript
 // so the conversation that is already live survives the first respawn too.
 const claudeHome = process.env.HOME ?? homedir()
-const claudeSid = loadOrCreateSid(
+let claudeSid = loadOrCreateSid(
   cfg.paths.state_dir,
   () => latestTranscriptSid(claudeHome, cfg.claude.workspace) ?? randomUUID(),
 )
@@ -181,6 +181,26 @@ const endTurn = async (finalState: 'done' = 'done'): Promise<void> => {
   if (turn.tickHandle) clearInterval(turn.tickHandle)
   if (turn.progressMsgId != null) {
     await bot.editHtml(turn.chatId, turn.progressMsgId, turn.tracker.render(finalState))
+  }
+}
+
+// Before /new: let the size-rotator's handoff script summarise the old
+// transcript into state/last-rotation-handoff.md (picked up by the SessionStart
+// hook of the fresh session). Best effort, 90 s cap, never blocks the restart.
+const ROTATION_HANDOFF_SCRIPT = process.env.ROTATION_HANDOFF_SCRIPT
+  ?? '/home/edgelab/.claude-lab/a2meta/bin/rotation-handoff.py'
+const writeRotationHandoff = async (sid: string): Promise<void> => {
+  const tp = transcriptPath(claudeHome, cfg.claude.workspace, sid)
+  if (!existsSync(ROTATION_HANDOFF_SCRIPT) || !existsSync(tp)) return
+  const out = join(cfg.paths.state_dir, 'last-rotation-handoff.md')
+  try {
+    const proc = Bun.spawn(['python3', ROTATION_HANDOFF_SCRIPT, tp, sid, out], { stdout: 'ignore', stderr: 'pipe' })
+    const timer = setTimeout(() => proc.kill(), 90_000)
+    const code = await proc.exited
+    clearTimeout(timer)
+    log.info('rotation handoff before /new', { code, out })
+  } catch (err) {
+    log.warn('rotation handoff failed (continuing /new)', { error: String(err) })
   }
 }
 
@@ -723,6 +743,10 @@ const onTelegramMessage = async (msg: {
     // Hard restart: kill + respawn the Claude process and wipe all bridge state.
     // Works even when the TUI input loop is dead (the failure mode where typed
     // /stop and /clear are silently ignored).
+    // /new additionally rotates the session id → clean context (the old
+    // transcript stays on disk). /reset|/clear|/kill respawn with --resume, i.e.
+    // keep the conversation — that is the hang-recovery path.
+    const fresh = cmd === '/new'
     disarmBusyTimer()
     stopPaneWatcher()
     stopMirror()
@@ -735,8 +759,16 @@ const onTelegramMessage = async (msg: {
     fsm.forceIdle()
     void dbSetIdle()
     try {
+      if (fresh) {
+        const oldSid = claudeSid
+        await writeRotationHandoff(oldSid)
+        claudeSid = rotateSid(cfg.paths.state_dir)
+        log.info('session id rotated by /new', { old: oldSid, sid: claudeSid })
+      }
       await tmux.hardRestart()
-      await bot.sendHtml(msg.chat.id, "🔄 Сессия Claude перезапущена (чистый контекст).")
+      await bot.sendHtml(msg.chat.id, fresh
+        ? "🆕 Новая сессия Claude: чистый контекст, старый разговор в архиве транскриптов."
+        : "🔄 Процесс Claude перезапущен, разговор продолжен (--resume). Чистый контекст — <code>/new</code>.")
     } catch (err) {
       log.warn('hard restart failed', { error: String(err) })
       await bot.sendHtml(msg.chat.id, "⚠️ ошибка рестарта: " + escapeHtml(String(err)))
