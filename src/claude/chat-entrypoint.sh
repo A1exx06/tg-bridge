@@ -42,6 +42,13 @@ PASTE_SETTLE="${CHAT_PASTE_SETTLE:-0.6}"
 SUBMIT_RETRY_DELAY="${CHAT_SUBMIT_RETRY_DELAY:-0.4}"
 SUBMIT_RETRY_FACTOR="${CHAT_SUBMIT_RETRY_FACTOR:-1.8}"
 SUBMIT_RETRY_MAX="${CHAT_SUBMIT_RETRY_MAX:-5}"
+# Busy gate (2026-09-01): never paste while claude is generating or compacting.
+# A paste into a running turn is only queued in the composer (fingerprint
+# stays visible -> false "not confirmed"), and a paste into a compaction /
+# bootstrap frame is silently lost. So we wait for an idle composer first.
+BUSY_POLL_INTERVAL="${CHAT_BUSY_POLL_INTERVAL:-2}"
+BUSY_WAIT_MAX="${CHAT_BUSY_WAIT_MAX:-3600}"
+BUSY_PATTERN="${CHAT_BUSY_PATTERN:-esc to interrupt|Compacting conversation|Bootstrapping}"
 
 # ───── Injection helpers (PANE is a global set by the watcher subshell) ─────
 
@@ -69,6 +76,22 @@ wait_claude_ready() {
   return 0
 }
 
+# Block while the TUI is busy (generating / compacting / bootstrapping).
+# Returns 0 when idle; on timeout logs and returns 0 (degrade to inject
+# anyway — the message must never be dropped by the gate itself).
+wait_claude_idle() {
+  local waited=0
+  while pane_text | grep -qiE "$BUSY_PATTERN"; do
+    if (( waited >= BUSY_WAIT_MAX )); then
+      echo "chat-entrypoint(watcher): busy-wait timeout after ${waited}s, injecting anyway" >&2
+      return 0
+    fi
+    sleep "$BUSY_POLL_INTERVAL"
+    waited=$(( waited + ${BUSY_POLL_INTERVAL%.*} ))
+  done
+  return 0
+}
+
 # A distinctive substring of the prompt to judge "still in the composer".
 # python3 keeps the 60-char truncation UTF-8-safe (byte cut -c would split
 # multibyte Russian text into a pattern that can never match the pane).
@@ -93,6 +116,7 @@ submit_prompt() {
   fp="$(prompt_fingerprint "$msg_text")"
 
   wait_claude_ready
+  wait_claude_idle
 
   pre_generating=0
   if pane_text | grep -qiE 'esc to interrupt'; then
@@ -219,6 +243,9 @@ mkdir -p "$INBOX" "$PROCESSED"
 
 # ───── Background inbox watcher ─────
 (
+  # Watcher diagnostics go to a log, not to the pane: anything printed into
+  # the pane lands on top of the composer and reads like typed input.
+  exec 2>>"${CHAT_WATCHER_LOG:-${INBOX}/watcher.log}"
   PANE="${TMUX_PANE:-}"
   if [[ -z "$PANE" ]]; then
     echo "chat-entrypoint(watcher): TMUX_PANE not set, watcher disabled" >&2
