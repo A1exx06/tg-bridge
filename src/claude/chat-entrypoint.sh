@@ -241,6 +241,26 @@ INBOX="${CHAT_INBOX_DIR}"
 PROCESSED="${INBOX}/.processed"
 mkdir -p "$INBOX" "$PROCESSED"
 
+# Placed ABOVE the watcher on purpose (a2meta, 08.09.2026): the watcher
+# subshell below is forked from THIS process, so unsetting after it would
+# leave the token in the watcher's own environment and in anything it runs.
+# The agent process must NOT inherit the bridge's own Telegram bot token
+# (08.09.2026, Alexander's word). systemd gives us TELEGRAM_BOT_TOKEN via the
+# channel's EnvironmentFile because src/config.ts needs it — but that is the
+# BRIDGE's need, and the bun server reads it in its own process. Everything
+# below this line inherits our env: claude, its shells, every codex leg and
+# every pytest run. Two ways that bites, both measured on this box:
+#   * `docker compose` interpolates a shell variable OVER the project's own
+#     .env, so a2route's containers would be handed the CHAT bot's token
+#     instead of their own;
+#   * a backend test that reads TELEGRAM_BOT_TOKEN from the environment sends
+#     real messages to real people through the owner's own chat bot.
+# Consumers that legitimately need the token (status-report-15m.sh,
+# idle-guard.sh, a2meta-probe.ts, a2meta-token-swap.sh,
+# check_agent_grant_expiry.py) all read it from a FILE, not from the
+# environment, so nothing downstream breaks by unsetting it here.
+unset TELEGRAM_BOT_TOKEN
+
 # ───── Background inbox watcher ─────
 (
   # Watcher diagnostics go to a log, not to the pane: anything printed into
@@ -288,21 +308,4 @@ trap cleanup EXIT INT TERM
 # process so tmux remain-on-exit semantics work. "$@" carries our claude
 # binary + session-id/--resume flags; the OAuth token is already in env
 # (the caller sourced the 0600 secret env before exec'ing this script).
-# The agent process must NOT inherit the bridge's own Telegram bot token
-# (08.09.2026, Alexander's word). systemd gives us TELEGRAM_BOT_TOKEN via the
-# channel's EnvironmentFile because src/config.ts needs it — but that is the
-# BRIDGE's need, and the bun server reads it in its own process. Everything
-# below this line inherits our env: claude, its shells, every codex leg and
-# every pytest run. Two ways that bites, both measured on this box:
-#   * `docker compose` interpolates a shell variable OVER the project's own
-#     .env, so a2route's containers would be handed the CHAT bot's token
-#     instead of their own;
-#   * a backend test that reads TELEGRAM_BOT_TOKEN from the environment sends
-#     real messages to real people through the owner's own chat bot.
-# Consumers that legitimately need the token (status-report-15m.sh,
-# idle-guard.sh, a2meta-probe.ts, a2meta-token-swap.sh,
-# check_agent_grant_expiry.py) all read it from a FILE, not from the
-# environment, so nothing downstream breaks by unsetting it here.
-unset TELEGRAM_BOT_TOKEN
-
 exec "$@"
