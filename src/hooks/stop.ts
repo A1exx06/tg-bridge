@@ -23,6 +23,14 @@ function extractText(content: unknown): string {
   return ''
 }
 
+function isUserPrompt(content: unknown): boolean {
+  if (typeof content === 'string') return content.length > 0
+  if (Array.isArray(content)) {
+    return (content as ContentBlock[]).some(b => b?.type !== 'tool_result')
+  }
+  return false
+}
+
 export async function handleStopHook(input: StopHookInput): Promise<StopHookOutput> {
   const direct = extractText(input.last_assistant_message)
   if (direct.length > 0) return { assistant_message: direct }
@@ -42,6 +50,13 @@ export async function handleStopHook(input: StopHookInput): Promise<StopHookOutp
       if (parsed.type === 'assistant') {
         const text = extractText(parsed.message?.content ?? parsed.content)
         if (text.length > 0) return { assistant_message: text }
+      }
+      // Turn boundary: a real user prompt (not a tool_result envelope) means
+      // the current turn produced no text at all (e.g. it ended on a deferred
+      // tool such as ScheduleWakeup). Never walk into the previous turn —
+      // that re-sent the previous reply verbatim (duplicates, 10.09.2026).
+      if (parsed.type === 'user' && isUserPrompt(parsed.message?.content ?? parsed.content)) {
+        return { assistant_message: '' }
       }
     } catch { /* skip malformed */ }
   }
