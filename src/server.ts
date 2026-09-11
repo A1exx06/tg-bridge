@@ -125,6 +125,14 @@ interface InboundOrigin {
   web_session_id?: string
 }
 const lastInbound = new Map<number, InboundOrigin>()
+// Пустой ход агента (ход закрыт деферред-инструментом, текста нет) раньше
+// уходил в тишину: владелец видел «прочитал, подумал, не ответил» и считал
+// мост сломанным (10.09.2026). Отправляем одну служебную строку на КАЖДОЕ
+// живое сообщение из Telegram и только один раз — пробуждения приходят с тем
+// же origin, нового message_id у них нет, поэтому чат они не засоряют.
+const SILENT_TURN_NOTICE =
+  '(ход закрыт без ответа: сообщение получено и обработано, текста агент не дал)'
+let lastSilentNoticeMsgId = 0
 
 interface ActiveTurn {
   chatId: number
@@ -462,7 +470,11 @@ function stopMirror(): void {
 
 const drain = async () => {
   if (fsm.current() !== ClaudeState.IDLE) return
-  const next = queue.shift()
+  // Owner first: a Telegram message from the operator jumps ahead of queued
+  // agent-to-agent (swarm) deliveries. Long agent turns (subagents, gates)
+  // otherwise starve the owner behind the agent's own handoff traffic
+  // (metabolic, 11.09.2026: three owner messages waited >40 min).
+  const next = queue.shiftWhere((i) => i.channel === 'telegram') ?? queue.shift()
   if (!next) return
   const origin: InboundOrigin = { message_id: next.message_id, channel: next.channel }
   if (next.web_session_id) origin.web_session_id = next.web_session_id
@@ -1033,7 +1045,20 @@ const server = await startHttpServer({
         const dbText = text.length > 0 ? text : files.map((f) => `[file] ${f.path}`).join('\n')
         void dbInsertOut(originChannel, dbText, outMeta)
       }
+      // Ответ на это сообщение отдан — служебная строка по нему уже не нужна.
+      if (targetMsg !== undefined) lastSilentNoticeMsgId = targetMsg
     } else {
+      if (
+        targetChat !== undefined &&
+        originChannel === 'telegram' &&
+        targetMsg !== undefined &&
+        targetMsg > 0 &&
+        targetMsg !== lastSilentNoticeMsgId
+      ) {
+        lastSilentNoticeMsgId = targetMsg
+        log.info('silent turn notice', { chat: targetChat, message_id: targetMsg })
+        await bot.sendText(targetChat, SILENT_TURN_NOTICE)
+      }
       await endTurn('done')
     }
     void dbSetIdle()
