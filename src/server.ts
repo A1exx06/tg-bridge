@@ -17,6 +17,12 @@ import { startHttpServer } from './hooks/http-server.js'
 import { handleStopHook } from './hooks/stop.js'
 import { ProgressTracker } from './progress/tracker.js'
 import { transcribeAudio, loadGroqKey } from './voice/groq.js'
+
+// Domain vocabulary for voice notes: without it Whisper mangles project names ("A2 Route" -> "у дворов").
+const DEFAULT_VOICE_PROMPT =
+  'Александр диктует задачи по проектам A2 Route и a2vanta: оплата, пополнение баланса, депозит, USDT, USDC, ' +
+  'TRON, Base, AML-проверка, партнёрская программа, Mini App, Гермес, метаболик, a2coder, Astra, Кими, ' +
+  'спецификация, деплой, мерж, ревью, рилс, Threads, сценарий. Здоровье: Фиасп, Тресиба, сахар, ХЕ, Попов.'
 import { downloadTelegramFile } from './telegram/file.js'
 import { cleanupUploads } from './uploads/cleanup.js'
 import { getSql, closeSql, loadDsn, type Sql } from './db/pool.js'
@@ -593,7 +599,12 @@ const transcribeIfVoice = async (msg: {
     const mime = filename.endsWith('.ogg') || filename.endsWith('.oga')
       ? 'audio/ogg'
       : 'audio/mpeg'
-    const text = await transcribeAudio({ apiKey: key, audio: buf, filename, mimeType: mime })
+    // Owner speaks Russian; without a language hint Whisper guesses per message and garbles words.
+    const text = await transcribeAudio({
+      apiKey: key, audio: buf, filename, mimeType: mime,
+      language: process.env.VOICE_LANGUAGE || 'ru',
+      prompt: process.env.VOICE_PROMPT || DEFAULT_VOICE_PROMPT,
+    })
     log.info('voice transcribed', { len: text.length })
     return text
   } catch (err) {

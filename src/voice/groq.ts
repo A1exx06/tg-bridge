@@ -9,6 +9,8 @@ export interface TranscribeOpts {
   filename: string
   mimeType: string
   language?: string
+  // Vocabulary hint: Whisper biases decoding toward these words (project names, terms).
+  prompt?: string
 }
 
 export async function transcribeAudio(opts: TranscribeOpts): Promise<string> {
@@ -17,6 +19,7 @@ export async function transcribeAudio(opts: TranscribeOpts): Promise<string> {
   form.append('file', blob, opts.filename)
   form.append('model', MODEL)
   if (opts.language) form.append('language', opts.language)
+  if (opts.prompt) form.append('prompt', opts.prompt)
   const res = await fetch(GROQ_URL, {
     method: 'POST',
     headers: { Authorization: `Bearer ${opts.apiKey}` },
