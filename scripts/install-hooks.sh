@@ -34,17 +34,18 @@ p = "$SETTINGS"
 with open(p) as f: cfg = json.load(f)
 hooks = cfg.setdefault("hooks", {})
 
-def replace(name, command):
+def replace(name, command, timeout):
     entries = hooks.setdefault(name, [])
     entries[:] = [e for e in entries if e.get("marker") != "tg-bridge-hook"]
     entries.append({
         "marker": "tg-bridge-hook",
-        "hooks": [{"type": "command", "command": command}]
+        # Bounded so a hung bridge cannot stall every tool call.
+        "hooks": [{"type": "command", "command": command, "timeout": timeout}]
     })
 
-replace("Stop", "$HOOK_CMD_STOP")
-replace("PreToolUse", "$HOOK_CMD_PRE")
-replace("PostToolUse", "$HOOK_CMD_POST")
+replace("Stop", "$HOOK_CMD_STOP", 30)
+replace("PreToolUse", "$HOOK_CMD_PRE", 10)
+replace("PostToolUse", "$HOOK_CMD_POST", 10)
 with open(p, "w") as f: json.dump(cfg, f, indent=2)
 print(f"install-hooks.sh: patched {p}")
 PY
