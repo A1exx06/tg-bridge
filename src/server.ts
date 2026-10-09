@@ -527,8 +527,12 @@ function tsPrefix(): string {
   return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`
 }
 
+// Bot API getFile only serves files up to 20 MB: a failed save is surfaced to the
+// agent as a note instead of silently dropping the message.
+let lastSaveFailure: string | null = null
+
 const saveIfFile = async (msg: {
-  document?: { file_id: string; file_name?: string }
+  document?: { file_id: string; file_name?: string; file_size?: number; mime_type?: string }
   photo?: Array<{ file_id: string; file_size?: number }>
   video?: { file_id: string; file_name?: string }
   audio?: { file_id: string; file_name?: string }
@@ -550,6 +554,10 @@ const saveIfFile = async (msg: {
     return savePath
   } catch (err) {
     log.warn('file save failed', { error: String(err) })
+    const d = msg.document
+    const size = d?.file_size ? `${(d.file_size / 1048576).toFixed(1)} МБ` : 'размер неизвестен'
+    lastSaveFailure = `Оператор прислал файл, но бот не смог его скачать (${String(err)}; Bot API отдаёт файлы до 20 МБ): `
+      + `${d?.file_name ?? 'без имени'}, ${size}, ${d?.mime_type ?? 'тип неизвестен'}. Забрать через Telegram-аккаунт владельца (чип).`
     return null
   }
 }
@@ -817,10 +825,13 @@ const onTelegramMessage = async (msg: {
   }
   let text = msg.text ?? msg.caption ?? ''
   if (!text && msg.rich_message) text = richBlocksToPlain(msg.rich_message.blocks)
+  lastSaveFailure = null
   const savedPath = await saveIfFile(msg)
   if (savedPath) {
     const prefix = `Оператор прислал файл: ${savedPath}`
     text = text ? `${prefix}\n${text}` : prefix
+  } else if (lastSaveFailure) {
+    text = text ? `${lastSaveFailure}\n${text}` : lastSaveFailure
   }
   // Voice/audio is both saved to disk (savedPath above) and transcribed:
   // the transcript stays the operator's actual input, the file lets the agent
