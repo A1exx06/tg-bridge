@@ -319,6 +319,26 @@ const paneFingerprint = (s: string): string => {
   return lines.slice(-60).join('\n')
 }
 
+// Claude answers every prompt with "You've hit your session limit · resets …"
+// without running a turn, so no stop hook fires and the owner hears nothing.
+// Tell the owner once per limit window; the message stays queued until reset.
+const USAGE_LIMIT_RE = /hit your (?:session|usage|weekly) limit[^\n]*/i
+let limitAlerted = false
+const alertIfUsageLimit = async (): Promise<void> => {
+  let pane = ''
+  try { pane = await tmux.capturePane() } catch { return }
+  const m = pane.match(USAGE_LIMIT_RE)
+  if (!m) { limitAlerted = false; return }
+  if (limitAlerted || !ownerChatId) return
+  limitAlerted = true
+  log.warn('usage limit detected in pane', { line: m[0] })
+  await bot.sendHtml(
+    ownerChatId,
+    `tg-bridge: агент <code>${cfg.claude.tmux_session}</code> упёрся в лимит Claude (${m[0].replace(/[<>&]/g, '')}). ` +
+      `Сообщение в очереди, ответ придёт после сброса.`,
+  ).catch(() => {})
+}
+
 const armBusyTimer = (): void => {
   if (busyTimer) clearTimeout(busyTimer)
   busyTimer = setTimeout(() => {
@@ -332,6 +352,7 @@ const armBusyTimer = (): void => {
       // No activity at all this turn ⇒ the send-keys was swallowed (TUI was
       // busy/wedged). Re-queue the in-flight message so it isn't lost.
       if (inflight) {
+        void alertIfUsageLimit()
         log.warn('re-queuing swallowed message after busy timeout', { len: inflight.text.length })
         queue.push(inflight)
         inflight = null
