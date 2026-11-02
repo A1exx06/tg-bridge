@@ -32,7 +32,7 @@ import { writeFileSync } from 'fs'
 import { basename } from 'path'
 import { createRelay } from './permission/relay.js'
 import { needsRelay, type Policy } from './permission/policy.js'
-import { mkdirSync, existsSync, readFileSync } from 'fs'
+import { mkdirSync, existsSync, readFileSync, readdirSync, statSync } from 'fs'
 import { load as loadYaml } from 'js-yaml'
 import { join, dirname } from 'path'
 
@@ -966,6 +966,43 @@ const relay = createRelay({
   timeoutMs: cfg.limits.permission_timeout_ms,
   defaultDecision: cfg.limits.permission_default,
 })
+
+// An old pending file is evidence of stalled delivery even if the watcher
+// process still exists. Alert once per episode; retry revival every 30s.
+// A healthy/busy watcher keeps its flock, so recovery cannot double-paste.
+if (cfg.claude.input_channel === 'inbox') {
+  const inbox = join(cfg.paths.state_dir, 'inbox')
+  const stallMs = 3 * 60_000
+  let alerted = false
+  let checking = false
+  setInterval(() => {
+    if (checking) return
+    checking = true
+    void (async () => {
+      try {
+        const pending = readdirSync(inbox).filter(name => name.endsWith('.json'))
+        const oldest = pending.reduce((age, name) => {
+          try { return Math.min(age, statSync(join(inbox, name)).mtimeMs) }
+          catch { return age } // Concurrent archive is normal.
+        }, Infinity)
+        if (Date.now() - oldest < stallMs || oldest === Infinity) {
+          alerted = false
+          return
+        }
+        if (!await tmux.exists()) return
+        const attempted = await tmux.reviveWatcher()
+        log.warn('inbox delivery stalled; watcher recovery attempted', { attempted })
+        if (!alerted && ownerChatId) {
+          await bot.sendHtml(ownerChatId,
+            'tg-bridge: inbox не доставляется более 3 минут; пытаюсь поднять watcher без перезапуска Claude.')
+          alerted = true
+        }
+      } catch (error) {
+        log.warn('inbox watchdog failed', { error: String(error) })
+      } finally { checking = false }
+    })()
+  }, 30_000)
+}
 
 // --- Login watchdog --------------------------------------------------------
 // Claude Code OAuth tokens expire on a long-running session (token rotation

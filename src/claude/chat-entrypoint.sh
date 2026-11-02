@@ -232,12 +232,51 @@ process_inbox() {
   done < <(find "$INBOX" -maxdepth 1 -name '*.json' -print0 | sort -z)
 }
 
+# One consumer per inbox, including server-initiated recovery. Never unlink
+# the lock file: all generations must contend on the same inode.
+run_inbox_watcher() {
+  local parent_pid="$1" backoff=1 rc
+  exec 9>"${INBOX}/.watcher.lock"
+  flock -n 9 || return 0
+  parent_alive() { kill -0 "$parent_pid" 2>&-; }
+  while parent_alive; do
+    touch "${INBOX}/.watcher-heartbeat"
+    process_inbox || echo "chat-entrypoint(watcher): drain failed; retrying" >&2
+    parent_alive || break
+    rc=0
+    # A finite wait also catches events lost between drain and watch setup.
+    # Redirect to the watcher log, without relying on /dev/null.
+    inotifywait -q -t 5 -e create,moved_to --include '\.json$' "$INBOX" >>"${INBOX}/watcher.log" 2>&1 || rc=$?
+    if [[ "$rc" -eq 0 || "$rc" -eq 2 ]]; then
+      backoff=1
+      sleep 0.1
+    else
+      echo "chat-entrypoint(watcher): inotifywait failed ($rc); polling in ${backoff}s" >&2
+      sleep "$backoff"
+      if (( backoff < 8 )); then backoff=$((backoff * 2)); fi
+    fi
+  done
+  return 0
+}
+
 # ───── Test seam ─────
 # Sourced with CHAT_ENTRYPOINT_TEST_ONLY=1: define helpers and stop (no env
 # validation, no watcher, no exec). Lets tests drive submit_prompt /
 # process_inbox against a stub tmux on PATH.
 if [[ "${CHAT_ENTRYPOINT_TEST_ONLY:-}" == "1" ]]; then
   return 0 2>/dev/null || exit 0
+fi
+
+# Recovery entry: no Claude spawn, no restart, only a lock-protected watcher.
+if [[ "${1:-}" == "--watcher" ]]; then
+  unset TELEGRAM_BOT_TOKEN
+  parent_pid="$2"; PANE="$3"; socket="$4"; INBOX="$5"
+  PROCESSED="${INBOX}/.processed"
+  mkdir -p "$PROCESSED"
+  tmux() { command tmux -L "$socket" "$@"; }
+  exec 2>>"${INBOX}/watcher.log"
+  run_inbox_watcher "$parent_pid"
+  exit 0
 fi
 
 # ───── Required env (fail-safe) ─────
@@ -281,28 +320,9 @@ unset TELEGRAM_BOT_TOKEN
     exit 0
   fi
 
-  # Initial drain catches messages that arrived between writeToInbox() and
-  # our exec. submit_prompt's readiness gate handles the boot race.
-  process_inbox
+  # $$ remains the entrypoint PID, preserved by exec into Claude below.
+  run_inbox_watcher "$$"
 
-  # $$ inside the subshell is the original entrypoint PID (= claude after
-  # the exec below); when it dies we exit, so a leaked watcher can't keep
-  # moving inbox files meant for the next spawn.
-  parent_alive() { kill -0 "$$" 2>/dev/null; }
-
-  if command -v inotifywait >/dev/null 2>&1; then
-    while parent_alive \
-        && inotifywait -q -e create,moved_to --include '\.json$' "$INBOX" >/dev/null 2>&1; do
-      sleep 0.1
-      parent_alive || exit 0
-      process_inbox
-    done
-  else
-    while parent_alive; do
-      sleep 0.5
-      process_inbox
-    done
-  fi
 ) &
 WATCHER_PID=$!
 

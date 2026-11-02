@@ -52,6 +52,7 @@ export interface TmuxSession {
   sendEscape(): Promise<void>
   hardRestart(): Promise<void>
   capturePane(): Promise<string>
+  reviveWatcher(): Promise<boolean>
   kill(): Promise<void>
 }
 
@@ -166,6 +167,19 @@ export function createTmuxSession(opts: TmuxSessionOpts): TmuxSession {
       const r = await run([...baseArgs, 'capture-pane', '-t', opts.session, '-p'])
       if (!r.ok) throw new Error(`tmux capture-pane failed: ${r.stderr}`)
       return r.stdout
+    },
+    async reviveWatcher() {
+      if (!opts.inboxDir) return false
+      const pane = await run([...baseArgs, 'display-message', '-p', '-t', opts.session,
+        '#{pane_id} #{pane_pid} #{pane_dead}'])
+      const [id, pid, dead] = pane.stdout.trim().split(/\s+/)
+      if (!pane.ok || !id || !pid || dead !== '0' || !/^\d+$/.test(pid)) return false
+      // run-shell detaches the watcher from this server, not from Claude's
+      // lifetime. The script checks the pane PID and holds the inbox flock.
+      const command = ['bash', entrypointPath, '--watcher', pid, id, opts.socket, opts.inboxDir]
+        .map(shQuote).join(' ')
+      const result = await run([...baseArgs, 'run-shell', '-b', command])
+      return result.ok
     },
     async kill() {
       await run([...baseArgs, 'kill-server'])
