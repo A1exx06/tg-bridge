@@ -3,15 +3,26 @@ import { createLogger } from './log.js'
 import { createFsm, ClaudeState } from './claude/state.js'
 import { createQueue } from './claude/queue.js'
 import { createTmuxSession } from './claude/tmux-session.js'
+import { randomUUID } from 'node:crypto'
+import { homedir } from 'node:os'
+import { loadOrCreateSid, rotateSid, buildClaudeCommand, latestTranscriptSid, transcriptPath } from './claude/session-id.js'
 import { createBot } from './telegram/bot.js'
 import { allowMessage } from './telegram/gate.js'
 import { injectSenderPrefix } from './persona/sender-prefix.js'
 import { parseReply } from './reply/parser.js'
+import { routeFile } from './reply/file-route.js'
 import { formatReplyHtml } from './reply/markdown.js'
+import { redactOutbound } from './reply/redact-outbound.js'
 import { startHttpServer } from './hooks/http-server.js'
 import { handleStopHook } from './hooks/stop.js'
 import { ProgressTracker } from './progress/tracker.js'
 import { transcribeAudio, loadGroqKey } from './voice/groq.js'
+
+// Domain vocabulary for voice notes: without it Whisper mangles project names ("A2 Route" -> "у дворов").
+const DEFAULT_VOICE_PROMPT =
+  'Александр диктует задачи по проектам A2 Route и a2vanta: оплата, пополнение баланса, депозит, USDT, USDC, ' +
+  'TRON, Base, AML-проверка, партнёрская программа, Mini App, Гермес, метаболик, a2coder, Astra, Кими, ' +
+  'спецификация, деплой, мерж, ревью, рилс, Threads, сценарий. Здоровье: Фиасп, Тресиба, сахар, ХЕ, Попов.'
 import { downloadTelegramFile } from './telegram/file.js'
 import { cleanupUploads } from './uploads/cleanup.js'
 import { getSql, closeSql, loadDsn, type Sql } from './db/pool.js'
@@ -21,9 +32,9 @@ import { writeFileSync } from 'fs'
 import { basename } from 'path'
 import { createRelay } from './permission/relay.js'
 import { needsRelay, type Policy } from './permission/policy.js'
-import { mkdirSync, existsSync, readFileSync } from 'fs'
+import { mkdirSync, existsSync, readFileSync, readdirSync, statSync } from 'fs'
 import { load as loadYaml } from 'js-yaml'
-import { join } from 'path'
+import { join, dirname } from 'path'
 
 const cfg = loadConfig(process.env)
 
@@ -79,17 +90,40 @@ const queue = createQueue<QueueItem>({
   maxDepth: cfg.limits.queue_max_depth,
 })
 
+// Stable session id persisted on disk → resume the same conversation across
+// reboot / hardRestart instead of starting fresh (gateway.py's durable-resume).
+// On first run (no sid file yet) adopt the workspace's most recent transcript
+// so the conversation that is already live survives the first respawn too.
+const claudeHome = process.env.HOME ?? homedir()
+let claudeSid = loadOrCreateSid(
+  cfg.paths.state_dir,
+  () => latestTranscriptSid(claudeHome, cfg.claude.workspace) ?? randomUUID(),
+)
+log.info('claude session id', { sid: claudeSid })
 const tmux = createTmuxSession({
   socket: cfg.claude.tmux_socket,
   session: cfg.claude.tmux_session,
   cwd: cfg.claude.workspace,
-  command: `${cfg.claude.binary} ${cfg.claude.flags}`,
+  secretDir: cfg.paths.state_dir,
+  // Inbox-channel opt-in (INPUT_CHANNEL=inbox). Unset → legacy send-keys.
+  inboxDir:
+    cfg.claude.input_channel === 'inbox'
+      ? join(cfg.paths.state_dir, 'inbox')
+      : undefined,
+  buildCommand: () =>
+    buildClaudeCommand({
+      binary: cfg.claude.binary,
+      flags: cfg.claude.flags,
+      workspace: cfg.claude.workspace,
+      sid: claudeSid,
+      home: claudeHome,
+    }),
 })
 
 await tmux.ensure()
 log.info('tmux session ready')
 
-const bot = createBot(cfg.telegram.bot_token, log)
+const bot = createBot(cfg.telegram.bot_token, log, { deadLetterDir: cfg.paths.log_dir })
 
 interface InboundOrigin {
   message_id: number
@@ -97,6 +131,14 @@ interface InboundOrigin {
   web_session_id?: string
 }
 const lastInbound = new Map<number, InboundOrigin>()
+// Пустой ход агента (ход закрыт деферред-инструментом, текста нет) раньше
+// уходил в тишину: владелец видел «прочитал, подумал, не ответил» и считал
+// мост сломанным (10.09.2026). Отправляем одну служебную строку на КАЖДОЕ
+// живое сообщение из Telegram и только один раз — пробуждения приходят с тем
+// же origin, нового message_id у них нет, поэтому чат они не засоряют.
+const SILENT_TURN_NOTICE =
+  '(ход закрыт без ответа: сообщение получено и обработано, текста агент не дал)'
+let lastSilentNoticeMsgId = 0
 
 interface ActiveTurn {
   chatId: number
@@ -156,6 +198,26 @@ const endTurn = async (finalState: 'done' = 'done'): Promise<void> => {
   }
 }
 
+// Before /new: let the size-rotator's handoff script summarise the old
+// transcript into state/last-rotation-handoff.md (picked up by the SessionStart
+// hook of the fresh session). Best effort, 90 s cap, never blocks the restart.
+const ROTATION_HANDOFF_SCRIPT = process.env.ROTATION_HANDOFF_SCRIPT
+  ?? '/home/edgelab/.claude-lab/a2meta/bin/rotation-handoff.py'
+const writeRotationHandoff = async (sid: string): Promise<void> => {
+  const tp = transcriptPath(claudeHome, cfg.claude.workspace, sid)
+  if (!existsSync(ROTATION_HANDOFF_SCRIPT) || !existsSync(tp)) return
+  const out = join(cfg.paths.state_dir, 'last-rotation-handoff.md')
+  try {
+    const proc = Bun.spawn(['python3', ROTATION_HANDOFF_SCRIPT, tp, sid, out], { stdout: 'ignore', stderr: 'pipe' })
+    const timer = setTimeout(() => proc.kill(), 90_000)
+    const code = await proc.exited
+    clearTimeout(timer)
+    log.info('rotation handoff before /new', { code, out })
+  } catch (err) {
+    log.warn('rotation handoff failed (continuing /new)', { error: String(err) })
+  }
+}
+
 const endTurnAndDelete = async (): Promise<void> => {
   if (!active) return
   const turn = active
@@ -167,6 +229,12 @@ const endTurnAndDelete = async (): Promise<void> => {
 }
 
 let busyTimer: ReturnType<typeof setTimeout> | null = null
+// Message sent into the tmux pane but not yet acknowledged by any Claude
+// activity (pretool / stop). If the busy timeout fires while this is still
+// set, the send-keys never started a turn (TUI was busy/wedged on the
+// previous turn) and the message was swallowed — so we re-queue it instead of
+// dropping it. Cleared on the first real activity of the turn.
+let inflight: QueueItem | null = null
 let paneWatcher: ReturnType<typeof setInterval> | null = null
 let typingPulse: ReturnType<typeof setInterval> | null = null
 let typingChat: number | null = null
@@ -178,6 +246,18 @@ let lastPaneFingerprint = ''
 // alive and waiting for the operator. We freeze the heartbeat for these.
 const AWAITING_USER_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode'])
 let awaitingUserTool: string | null = null
+// The option-question message surfaced to Telegram for the active modal. The
+// question already shows in the mirror, so once it's answered we delete this
+// (and the operator's typed answer) — keeping the chat to the mirror + the real
+// conversation. Scoped to this modal only; nothing else is removed.
+let awaitingModal: { chat: number; msgId: number } | null = null
+
+const clearAwaitingModal = (alsoDelete: boolean): void => {
+  if (awaitingModal && alsoDelete) {
+    void bot.deleteMessage(awaitingModal.chat, awaitingModal.msgId).catch(() => {})
+  }
+  awaitingModal = null
+}
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -189,7 +269,7 @@ function renderAwaitingUserPrompt(tool: string, args: Record<string, unknown>): 
       ? (args as { questions: Array<Record<string, unknown>> }).questions
       : []
     if (questions.length === 0) return null
-    const lines: string[] = ['<b>❓ Agent savol berdi:</b>', '']
+    const lines: string[] = ['<b>❓ Агент задал вопрос:</b>', '']
     for (const q of questions) {
       const qText = typeof q.question === 'string' ? q.question : ''
       if (qText) lines.push(escapeHtml(qText))
@@ -202,16 +282,16 @@ function renderAwaitingUserPrompt(tool: string, args: Record<string, unknown>): 
       }
       lines.push('')
     }
-    lines.push("<i>Javobni shu chatga oddiy matn bilan yozing — Claude modal'iga uzatiladi.</i>")
+    lines.push('<i>Напишите ответ обычным текстом в этот чат — он будет передан агенту.</i>')
     return lines.join('\n')
   }
   if (tool === 'ExitPlanMode') {
     const plan = typeof (args as { plan?: unknown }).plan === 'string'
       ? (args as { plan: string }).plan
       : ''
-    const head = "<b>📋 Agent rejani tasdiqlash so'rayapti:</b>\n\n"
+    const head = '<b>📋 Агент просит подтвердить план:</b>\n\n'
     const body = plan ? `<pre>${escapeHtml(plan)}</pre>\n\n` : ''
-    return head + body + "<i>Tasdiqlash: \"ha\" deb yozing yoki o'zgartirish kerakli matnni yuboring.</i>"
+    return head + body + '<i>Подтвердить: напишите «да», либо пришлите нужные правки.</i>'
   }
   return null
 }
@@ -239,6 +319,26 @@ const paneFingerprint = (s: string): string => {
   return lines.slice(-60).join('\n')
 }
 
+// Claude answers every prompt with "You've hit your session limit · resets …"
+// without running a turn, so no stop hook fires and the owner hears nothing.
+// Tell the owner once per limit window; the message stays queued until reset.
+const USAGE_LIMIT_RE = /hit your (?:session|usage|weekly) limit[^\n]*/i
+let limitAlerted = false
+const alertIfUsageLimit = async (): Promise<void> => {
+  let pane = ''
+  try { pane = await tmux.capturePane() } catch { return }
+  const m = pane.match(USAGE_LIMIT_RE)
+  if (!m) { limitAlerted = false; return }
+  if (limitAlerted || !ownerChatId) return
+  limitAlerted = true
+  log.warn('usage limit detected in pane', { line: m[0] })
+  await bot.sendHtml(
+    ownerChatId,
+    `tg-bridge: агент <code>${cfg.claude.tmux_session}</code> упёрся в лимит Claude (${m[0].replace(/[<>&]/g, '')}). ` +
+      `Сообщение в очереди, ответ придёт после сброса.`,
+  ).catch(() => {})
+}
+
 const armBusyTimer = (): void => {
   if (busyTimer) clearTimeout(busyTimer)
   busyTimer = setTimeout(() => {
@@ -246,7 +346,19 @@ const armBusyTimer = (): void => {
     if (fsm.current() === ClaudeState.BUSY) {
       log.warn('busy timeout (no activity), forcing IDLE')
       stopPaneWatcher()
+      stopMirror()
+      stopTyping()
       void endTurn('done')
+      // No activity at all this turn ⇒ the send-keys was swallowed (TUI was
+      // busy/wedged). Re-queue the in-flight message so it isn't lost.
+      if (inflight) {
+        void alertIfUsageLimit()
+        log.warn('re-queuing swallowed message after busy timeout', { len: inflight.text.length })
+        // Inbox already persists the message: requeue would create a new
+        // JSON copy on every timeout while the watcher is unavailable.
+        if (cfg.claude.input_channel !== 'inbox') queue.push(inflight)
+        inflight = null
+      }
       fsm.forceIdle()
       void drain()
     }
@@ -280,14 +392,125 @@ const stopPaneWatcher = (): void => {
   if (paneWatcher) { clearInterval(paneWatcher); paneWatcher = null; lastPaneFingerprint = '' }
 }
 
+// ── Live terminal mirror ─────────────────────────────────────────────────────
+// During a long/stuck turn, edit a single Telegram message every interval with
+// the latest screen of the tmux pane (last N lines only — old lines drop off so
+// the message never grows past Telegram's 4096-char cap). A delayed start keeps
+// short turns clean; a stale marker flags a frozen/wedged session.
+let mirrorTimer: ReturnType<typeof setInterval> | null = null
+let mirrorStartTimer: ReturnType<typeof setTimeout> | null = null
+let mirrorMsgId: number | null = null
+let mirrorChat: number | null = null
+let mirrorLastBody = ''
+let mirrorLastChangeMs = 0
+let mirrorLastSentHtml = ''
+// Bumped by every stopMirror()/startMirror(). A mirror message is created with
+// an async send; if stopMirror runs while that send is still in flight, the
+// message is born AFTER its delete already ran and would hang forever. The tick
+// captures the generation before sending and, if it changed by the time the id
+// comes back, deletes its own orphan instead of leaking it.
+let mirrorGen = 0
+// When the current turn started — drives the "working — Ns" header on the mirror.
+let turnStartMs = 0
+
+const MIRROR_HARD_CAP = 3500
+const MIRROR_STALE_MS = 90000
+
+const formatMirror = (paneRaw: string, stale: boolean, elapsedSec: number): string => {
+  // The pane can show `export FOO_TOKEN=…`, ps output, curl -H "Authorization: …"
+  // — mask unambiguous credentials before the capture leaves the host.
+  const pane = redactOutbound(paneRaw)
+  let lines = pane.split('\n').map((l) => l.replace(/[ \t]+$/, ''))
+  while (lines.length && lines[lines.length - 1] === '') lines.pop()
+  while (lines.length && lines[0] === '') lines.shift()
+  if (lines.length > cfg.mirror.max_lines) lines = lines.slice(-cfg.mirror.max_lines)
+  let body = lines.join('\n')
+  while (body.length > MIRROR_HARD_CAP && lines.length > 1) {
+    lines.shift()
+    body = lines.join('\n')
+  }
+  if (body.length > MIRROR_HARD_CAP) body = body.slice(-MIRROR_HARD_CAP)
+  const name = escapeHtml(cfg.claude.tmux_session)
+  const working = stale
+    ? `⚠️ <b>завис</b> — ${elapsedSec}s · восстановить через <code>/new</code>`
+    : `⏳ <b>работает</b> — ${elapsedSec}s`
+  const head = `${working}\n🖥 <b>${name}</b> — терминал (живой)`
+  return `${head}\n<pre>${escapeHtml(body) || '(пусто)'}</pre>`
+}
+
+const renderMirrorTick = async (): Promise<void> => {
+  const chat = mirrorChat
+  if (chat === null) return
+  const gen = mirrorGen
+  let pane: string
+  try { pane = await tmux.capturePane() } catch { return }
+  const bodyKey = pane.replace(/[ \t]+$/gm, '')
+  const now = Date.now()
+  if (bodyKey !== mirrorLastBody) { mirrorLastBody = bodyKey; mirrorLastChangeMs = now }
+  const stale = now - mirrorLastChangeMs >= MIRROR_STALE_MS
+  const elapsedSec = turnStartMs ? Math.round((now - turnStartMs) / 1000) : 0
+  const html = formatMirror(pane, stale, elapsedSec)
+  if (html === mirrorLastSentHtml) return
+  try {
+    if (mirrorMsgId === null) {
+      const id = await bot.sendHtml(chat, html)
+      // Race guard: the mirror was stopped while this send was in flight. The
+      // just-created message is an orphan stopMirror could not see — delete it.
+      if (gen !== mirrorGen || mirrorChat === null) {
+        if (id !== null) void bot.deleteMessage(chat, id).catch(() => {})
+        return
+      }
+      mirrorMsgId = id
+    } else {
+      await bot.editHtml(chat, mirrorMsgId, html)
+    }
+    mirrorLastSentHtml = html
+  } catch (err) {
+    log.warn('mirror update failed', { error: String(err) })
+  }
+}
+
+const startMirror = (chatId: number): void => {
+  if (!cfg.mirror.enabled) return
+  stopMirror()
+  mirrorChat = chatId
+  mirrorLastBody = ''
+  mirrorLastChangeMs = Date.now()
+  mirrorLastSentHtml = ''
+  mirrorStartTimer = setTimeout(() => {
+    mirrorStartTimer = null
+    void renderMirrorTick()
+    mirrorTimer = setInterval(() => void renderMirrorTick(), cfg.mirror.interval_ms)
+  }, cfg.mirror.start_delay_ms)
+}
+
+function stopMirror(): void {
+  mirrorGen++ // invalidate any in-flight tick so a late send deletes its own orphan
+  if (mirrorStartTimer) { clearTimeout(mirrorStartTimer); mirrorStartTimer = null }
+  if (mirrorTimer) { clearInterval(mirrorTimer); mirrorTimer = null }
+  const chat = mirrorChat
+  const msg = mirrorMsgId
+  mirrorChat = null
+  mirrorMsgId = null
+  mirrorLastBody = ''
+  mirrorLastSentHtml = ''
+  if (chat !== null && msg !== null) void bot.deleteMessage(chat, msg).catch(() => {})
+}
+
 const drain = async () => {
   if (fsm.current() !== ClaudeState.IDLE) return
-  const next = queue.shift()
+  // Owner first: a Telegram message from the operator jumps ahead of queued
+  // agent-to-agent (swarm) deliveries. Long agent turns (subagents, gates)
+  // otherwise starve the owner behind the agent's own handoff traffic
+  // (metabolic, 11.09.2026: three owner messages waited >40 min).
+  const next = queue.shiftWhere((i) => i.channel === 'telegram') ?? queue.shift()
   if (!next) return
   const origin: InboundOrigin = { message_id: next.message_id, channel: next.channel }
   if (next.web_session_id) origin.web_session_id = next.web_session_id
   lastInbound.set(next.chat_id, origin)
   fsm.onSent()
+  inflight = next // cleared on first real activity (pretool/stop); re-queued if the turn never starts
+  turnStartMs = Date.now()
   const inMeta: Record<string, unknown> = { chat_id: next.chat_id, user_id: next.user_id }
   if (next.channel === 'telegram') inMeta.tg_message_id = next.message_id
   if (next.web_session_id) inMeta.web_session_id = next.web_session_id
@@ -298,6 +521,7 @@ const drain = async () => {
   await tmux.sendKeys(next.text)
   armBusyTimer()
   startPaneWatcher()
+  startMirror(next.chat_id)
 }
 
 const uploadsDir = join(cfg.claude.workspace, '.tg-uploads')
@@ -326,18 +550,26 @@ function tsPrefix(): string {
   return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`
 }
 
+// Bot API getFile only serves files up to 20 MB: a failed save is surfaced to the
+// agent as a note instead of silently dropping the message.
+let lastSaveFailure: string | null = null
+
 const saveIfFile = async (msg: {
-  document?: { file_id: string; file_name?: string }
+  document?: { file_id: string; file_name?: string; file_size?: number; mime_type?: string }
   photo?: Array<{ file_id: string; file_size?: number }>
   video?: { file_id: string; file_name?: string }
+  audio?: { file_id: string; file_name?: string }
+  voice?: { file_id: string }
 }): Promise<string | null> => {
   const file = msg.document
     ?? msg.video
+    ?? msg.audio
+    ?? msg.voice
     ?? (msg.photo && msg.photo.length > 0 ? msg.photo[msg.photo.length - 1] : undefined)
   if (!file) return null
   try {
     const { buf, filename } = await downloadTelegramFile(cfg.telegram.bot_token, file.file_id)
-    const hint = (msg.document?.file_name ?? msg.video?.file_name ?? filename)
+    const hint = (msg.document?.file_name ?? msg.video?.file_name ?? msg.audio?.file_name ?? filename)
     const name = safeFilename(hint)
     const savePath = join(uploadsDir, `${tsPrefix()}-${name}`)
     writeFileSync(savePath, Buffer.from(buf))
@@ -345,6 +577,10 @@ const saveIfFile = async (msg: {
     return savePath
   } catch (err) {
     log.warn('file save failed', { error: String(err) })
+    const d = msg.document
+    const size = d?.file_size ? `${(d.file_size / 1048576).toFixed(1)} МБ` : 'размер неизвестен'
+    lastSaveFailure = `Оператор прислал файл, но бот не смог его скачать (${String(err)}; Bot API отдаёт файлы до 20 МБ): `
+      + `${d?.file_name ?? 'без имени'}, ${size}, ${d?.mime_type ?? 'тип неизвестен'}. Забрать через Telegram-аккаунт владельца (чип).`
     return null
   }
 }
@@ -378,6 +614,32 @@ const renderStatus = (): string => {
   return `<pre>${lines.join('\n')}</pre>`
 }
 
+// Known Whisper hallucination tails on Russian silence; a sentence made only of these is dropped.
+const HALLUCINATION_RE = /(субтитры\s+(делал|сделал|создал|подготовил)|dimatorzok|редактор субтитров|продолжение следует|спасибо за (внимание|просмотр)|подписывайтесь на канал)/i
+const dropHallucinations = (t: string): string =>
+  t.split(/(?<=[.!?…])\s+/).filter((sent) => !HALLUCINATION_RE.test(sent)).join(' ').trim()
+
+// Cut silence longer than 0.6 s at both ends (and collapse mid pauses to 0.6 s) and re-encode to 16 kHz mono ogg/opus.
+const trimSilence = async (
+  buf: ArrayBuffer, filename: string,
+): Promise<{ buf: ArrayBuffer; filename: string; mime: string; applied: boolean }> => {
+  const mime = filename.endsWith('.ogg') || filename.endsWith('.oga') ? 'audio/ogg' : 'audio/mpeg'
+  try {
+    const proc = Bun.spawn([
+      'ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', 'pipe:0',
+      '-af', 'silenceremove=start_periods=1:start_threshold=-40dB:start_silence=0.3,'
+        + 'areverse,silenceremove=start_periods=1:start_threshold=-40dB:start_silence=0.3,areverse',
+      '-ac', '1', '-ar', '16000', '-c:a', 'libopus', '-b:a', '32k', '-f', 'ogg', 'pipe:1',
+    ], { stdin: new Uint8Array(buf), stdout: 'pipe', stderr: 'pipe' })
+    const out = await new Response(proc.stdout).arrayBuffer()
+    const code = await proc.exited
+    if (code !== 0 || out.byteLength < 1000) return { buf, filename, mime, applied: false }
+    return { buf: out, filename: 'voice.ogg', mime: 'audio/ogg', applied: true }
+  } catch {
+    return { buf, filename, mime, applied: false }
+  }
+}
+
 const transcribeIfVoice = async (msg: {
   voice?: { file_id: string; duration?: number }
   audio?: { file_id: string }
@@ -394,8 +656,17 @@ const transcribeIfVoice = async (msg: {
     const mime = filename.endsWith('.ogg') || filename.endsWith('.oga')
       ? 'audio/ogg'
       : 'audio/mpeg'
-    const text = await transcribeAudio({ apiKey: key, audio: buf, filename, mimeType: mime })
-    log.info('voice transcribed', { len: text.length })
+    // Whisper hallucinates on leading/trailing silence ("Субтитры делал ...", "Продолжение следует"):
+    // trim silence with ffmpeg first (20.09.2026), fall back to the raw file if ffmpeg is unavailable.
+    const trimmed = await trimSilence(buf, filename)
+    // Owner speaks Russian; without a language hint Whisper guesses per message and garbles words.
+    const raw = await transcribeAudio({
+      apiKey: key, audio: trimmed.buf, filename: trimmed.filename, mimeType: trimmed.mime,
+      language: process.env.VOICE_LANGUAGE || 'ru',
+      prompt: process.env.VOICE_PROMPT || DEFAULT_VOICE_PROMPT,
+    })
+    const text = dropHallucinations(raw)
+    log.info('voice transcribed', { len: text.length, rawLen: raw.length, trimmed: trimmed.applied })
     return text
   } catch (err) {
     log.warn('voice transcription failed', { error: String(err) })
@@ -403,16 +674,119 @@ const transcribeIfVoice = async (msg: {
   }
 }
 
+// Yes/no words that resolve a pending permission prompt when typed as text
+// (inline Allow/Deny buttons don't render on some clients — see relay.ts).
+const PERM_YES_RE = /^(да|ага|ок|окей|yes|y|ok|allow|разреш\w*|давай|можно|подтверждаю|\+)$/i
+const PERM_NO_RE = /^(нет|не|no|n|deny|запрет\w*|отмена|стоп|нельзя|-)$/i
+
+// True when the message was forwarded into the chat (any Telegram variant).
+const isForwarded = (m: {
+  forward_origin?: unknown; forward_from?: unknown
+  forward_from_chat?: unknown; forward_sender_name?: unknown
+}): boolean =>
+  !!(m.forward_origin || m.forward_from || m.forward_from_chat || m.forward_sender_name)
+
+// Human label of the original author of a forwarded message, or null if hidden.
+const forwardOriginLabel = (m: {
+  forward_origin?: {
+    type: string
+    sender_user?: { first_name?: string; username?: string }
+    sender_user_name?: string
+    sender_chat?: { title?: string; username?: string }
+    chat?: { title?: string; username?: string }
+  }
+  forward_from?: { first_name?: string; username?: string }
+  forward_from_chat?: { title?: string; username?: string }
+  forward_sender_name?: string
+}): string | null => {
+  const o = m.forward_origin
+  if (o) {
+    if (o.type === 'user' && o.sender_user)
+      return o.sender_user.first_name ?? o.sender_user.username ?? 'пользователь'
+    if (o.type === 'hidden_user') return o.sender_user_name ?? 'скрытый пользователь'
+    if (o.type === 'channel' && o.chat) return o.chat.title ?? o.chat.username ?? 'канал'
+    if (o.type === 'chat' && o.sender_chat)
+      return o.sender_chat.title ?? o.sender_chat.username ?? 'чат'
+  }
+  if (m.forward_from) return m.forward_from.first_name ?? m.forward_from.username ?? 'пользователь'
+  if (m.forward_from_chat) return m.forward_from_chat.title ?? m.forward_from_chat.username ?? 'чат'
+  if (m.forward_sender_name) return m.forward_sender_name
+  return null
+}
+
+// Bot API 10.1+ rich messages (sendRichMessage) arrive without `text`/`caption`;
+// the content lives in `rich_message.blocks`. Forwards of such messages (e.g.
+// another bot's report) used to be dropped silently. Flatten them to plain text.
+const richTextToPlain = (rt: unknown): string => {
+  if (typeof rt === 'string') return rt
+  if (Array.isArray(rt)) return rt.map(richTextToPlain).join('')
+  if (rt && typeof rt === 'object') {
+    const o = rt as Record<string, unknown>
+    if (o.text !== undefined) return richTextToPlain(o.text)
+    if (typeof o.label === 'string') return o.label
+  }
+  return ''
+}
+const richBlocksToPlain = (blocks: unknown): string => {
+  if (!Array.isArray(blocks)) return ''
+  const out: string[] = []
+  for (const b of blocks) {
+    if (!b || typeof b !== 'object') continue
+    const o = b as Record<string, unknown>
+    switch (o.type) {
+      case 'list':
+        for (const it of (Array.isArray(o.items) ? o.items : []) as Array<Record<string, unknown>>) {
+          const body = richBlocksToPlain(it.blocks)
+          out.push(`${typeof it.label === 'string' && it.label ? it.label : '-'} ${body}`.trim())
+        }
+        break
+      case 'table':
+        for (const row of (Array.isArray(o.cells) ? o.cells : []) as Array<Array<Record<string, unknown>>>) {
+          out.push(row.map((c) => richTextToPlain(c?.text)).join(' | '))
+        }
+        if (o.caption) out.push(richTextToPlain(o.caption))
+        break
+      case 'divider':
+        out.push('---')
+        break
+      default: {
+        if (o.summary) out.push(richTextToPlain(o.summary))
+        const t = richTextToPlain(o.text)
+        if (t) out.push(t)
+        if (o.blocks) out.push(richBlocksToPlain(o.blocks))
+        if (o.caption) out.push(richTextToPlain(o.caption))
+      }
+    }
+  }
+  return out.filter((x) => x.trim()).join('\n')
+}
+
 const onTelegramMessage = async (msg: {
   from?: { id: number; username?: string; first_name?: string }
   chat: { id: number }
   text?: string
   caption?: string
+  rich_message?: { blocks?: unknown[] }
   voice?: { file_id: string; duration?: number }
   audio?: { file_id: string }
   document?: { file_id: string; file_name?: string }
   photo?: Array<{ file_id: string; file_size?: number }>
   video?: { file_id: string; file_name?: string }
+  // Forwarded-message markers. grammY delivers these on the raw message object;
+  // forward_origin is the modern (Bot API 7.0+) shape, the rest are legacy
+  // fields still sent for backward compat. The bridge reads them so a forward
+  // is presented to the agent as "Alexander handed you this", not as a stray
+  // line from a third party that the agent shrugs off.
+  forward_origin?: {
+    type: string
+    sender_user?: { first_name?: string; username?: string }
+    sender_user_name?: string
+    sender_chat?: { title?: string; username?: string }
+    chat?: { title?: string; username?: string }
+  }
+  forward_from?: { first_name?: string; username?: string }
+  forward_from_chat?: { title?: string; username?: string }
+  forward_sender_name?: string
   message_id: number
 }) => {
   if (!msg.from) return
@@ -424,21 +798,110 @@ const onTelegramMessage = async (msg: {
     log.info('denied', { reason: gate, user_id: msg.from.id })
     return
   }
-  if ((msg.text ?? '').trim().toLowerCase() === '/status') {
+  const cmd = (msg.text ?? '').trim().toLowerCase()
+  if (cmd === '/status') {
     await bot.sendHtml(msg.chat.id, renderStatus())
     return
   }
+  // Bridge control commands. These must be handled here (not forwarded into the
+  // pane) because when the TUI is wedged, send-keys into Claude is ignored.
+  if (cmd === '/stop') {
+    // Soft interrupt: Escape into the pane + reset bridge turn state to IDLE so
+    // the next message can drain. If the input loop is wedged, use /new instead.
+    disarmBusyTimer()
+    stopPaneWatcher()
+    stopMirror()
+    stopTyping()
+    awaitingUserTool = null
+    clearAwaitingModal(true)
+    inflight = null // operator interrupted ⇒ don't re-queue the in-flight message
+    await tmux.sendEscape().catch(() => {})
+    await endTurn('done')
+    fsm.forceIdle()
+    void dbSetIdle()
+    await bot.sendHtml(msg.chat.id, "⏹ Отправлен Escape, состояние IDLE. Если завис — <code>/new</code> сделает hard restart.")
+    void drain()
+    return
+  }
+  if (cmd === '/new' || cmd === '/reset' || cmd === '/clear' || cmd === '/kill') {
+    // Hard restart: kill + respawn the Claude process and wipe all bridge state.
+    // Works even when the TUI input loop is dead (the failure mode where typed
+    // /stop and /clear are silently ignored).
+    // /new additionally rotates the session id → clean context (the old
+    // transcript stays on disk). /reset|/clear|/kill respawn with --resume, i.e.
+    // keep the conversation — that is the hang-recovery path.
+    const fresh = cmd === '/new'
+    disarmBusyTimer()
+    stopPaneWatcher()
+    stopMirror()
+    stopTyping()
+    awaitingUserTool = null
+    clearAwaitingModal(true)
+    inflight = null // hard reset wipes all pending state
+    await endTurnAndDelete()
+    while (queue.shift()) { /* drain pending */ }
+    fsm.forceIdle()
+    void dbSetIdle()
+    try {
+      if (fresh) {
+        const oldSid = claudeSid
+        await writeRotationHandoff(oldSid)
+        claudeSid = rotateSid(cfg.paths.state_dir)
+        log.info('session id rotated by /new', { old: oldSid, sid: claudeSid })
+      }
+      await tmux.hardRestart()
+      await bot.sendHtml(msg.chat.id, fresh
+        ? "🆕 Новая сессия Claude: чистый контекст, старый разговор в архиве транскриптов."
+        : "🔄 Процесс Claude перезапущен, разговор продолжен (--resume). Чистый контекст — <code>/new</code>.")
+    } catch (err) {
+      log.warn('hard restart failed', { error: String(err) })
+      await bot.sendHtml(msg.chat.id, "⚠️ ошибка рестарта: " + escapeHtml(String(err)))
+    }
+    return
+  }
+  // Text-reply to a pending permission prompt. When the relay is blocking on a
+  // verdict, the agent is mid-tool-call (FSM BUSY) and a normal queue.push would
+  // never drain — so a bare "да"/"нет" here is the answer to that prompt, not a
+  // new instruction. Only the gated owner reaches this (gate checked above).
+  if (relay.pendingCount() > 0) {
+    const t = (msg.text ?? '').trim()
+    if (PERM_YES_RE.test(t)) {
+      relay.answerLatest('allow')
+      void bot.setReaction(msg.chat.id, msg.message_id, 'check').catch(() => {})
+      return
+    }
+    if (PERM_NO_RE.test(t)) {
+      relay.answerLatest('deny')
+      void bot.setReaction(msg.chat.id, msg.message_id, 'cross').catch(() => {})
+      return
+    }
+  }
   let text = msg.text ?? msg.caption ?? ''
+  if (!text && msg.rich_message) text = richBlocksToPlain(msg.rich_message.blocks)
+  lastSaveFailure = null
   const savedPath = await saveIfFile(msg)
   if (savedPath) {
-    const prefix = `Operator fayl yubordi: ${savedPath}`
+    const prefix = `Оператор прислал файл: ${savedPath}`
     text = text ? `${prefix}\n${text}` : prefix
+  } else if (lastSaveFailure) {
+    text = text ? `${lastSaveFailure}\n${text}` : lastSaveFailure
+  }
+  // Voice/audio is both saved to disk (savedPath above) and transcribed:
+  // the transcript stays the operator's actual input, the file lets the agent
+  // work with the raw audio (music recognition, tone, re-listening).
+  if (!text || msg.voice || msg.audio) {
+    const transcript = await transcribeIfVoice(msg)
+    if (transcript) text = text ? `${text}\n${transcript}` : transcript
   }
   if (!text) {
-    const transcript = await transcribeIfVoice(msg)
-    if (transcript) text = transcript
+    log.warn('inbound message dropped: no extractable text', { keys: Object.keys(msg), forwarded: isForwarded(msg) })
+    return
   }
-  if (!text) return
+  if (isForwarded(msg)) {
+    const origin = forwardOriginLabel(msg)
+    const src = origin ? ` (исходный автор: ${origin})` : ''
+    text = `[Александр переслал тебе это сообщение${src}. Это ввод от Александра — прочитай и обработай/ответь по сути, не считай чужой перепиской и не пропускай.]\n\n${text}`
+  }
   if (cfg.features.inject_sender_identity) {
     text = injectSenderPrefix({
       text,
@@ -455,6 +918,10 @@ const onTelegramMessage = async (msg: {
   if (awaitingUserTool) {
     log.info('routing message into active modal', { tool: awaitingUserTool, text_len: text.length })
     await tmux.sendKeys(text)
+    // Answered the option-question by typing — drop the surfaced question and
+    // this answer message (only this modal's; the rest of the chat stays).
+    clearAwaitingModal(true)
+    void bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {})
     return
   }
   const dropped = queue.push({
@@ -473,6 +940,19 @@ const ownerChatId =
   cfg.telegram.allowed_user_ids[0] ??
   0
 
+// The outbound reply must reach the human operator's Telegram chat. Swarm
+// pushes (agent-to-agent) are enqueued for context but carry their own chat_id
+// — often a stale/legacy owner id — and would otherwise become the last key in
+// `lastInbound`, hijacking the reply target and causing "chat not found".
+// Pick the most recent NON-swarm inbound; fall back to the owner chat.
+const resolveReplyTarget = (): { chat: number | undefined; origin: InboundOrigin | undefined } => {
+  const human = Array.from(lastInbound.entries())
+    .filter(([, o]) => (o.channel ?? 'telegram') !== 'swarm')
+    .pop()
+  if (human) return { chat: human[0], origin: human[1] }
+  return { chat: ownerChatId || undefined, origin: undefined }
+}
+
 const relay = createRelay({
   sendPrompt: async (chatId, text, reqId) => {
     await bot.raw.api.sendMessage(chatId, text, {
@@ -488,6 +968,94 @@ const relay = createRelay({
   timeoutMs: cfg.limits.permission_timeout_ms,
   defaultDecision: cfg.limits.permission_default,
 })
+
+// An old pending file is evidence of stalled delivery even if the watcher
+// process still exists. Alert once per episode; retry revival every 30s.
+// A healthy/busy watcher keeps its flock, so recovery cannot double-paste.
+if (cfg.claude.input_channel === 'inbox') {
+  const inbox = join(cfg.paths.state_dir, 'inbox')
+  const stallMs = 3 * 60_000
+  let alerted = false
+  let checking = false
+  setInterval(() => {
+    if (checking) return
+    checking = true
+    void (async () => {
+      try {
+        if (!existsSync(inbox)) return
+        const pending = readdirSync(inbox).filter(name => name.endsWith('.json'))
+        const oldest = pending.reduce((age, name) => {
+          try { return Math.min(age, statSync(join(inbox, name)).mtimeMs) }
+          catch { return age } // Concurrent archive is normal.
+        }, Infinity)
+        if (Date.now() - oldest < stallMs || oldest === Infinity) {
+          alerted = false
+          return
+        }
+        if (!await tmux.exists()) return
+        const attempted = await tmux.reviveWatcher()
+        log.warn('inbox delivery stalled; watcher recovery attempted', { attempted })
+        if (!alerted && ownerChatId) {
+          await bot.sendHtml(ownerChatId,
+            'tg-bridge: inbox не доставляется более 3 минут; пытаюсь поднять watcher без перезапуска Claude.')
+          alerted = true
+        }
+      } catch (error) {
+        log.warn('inbox watchdog failed', { error: String(error) })
+      } finally { checking = false }
+    })()
+  }, 30_000)
+}
+
+// --- Login watchdog --------------------------------------------------------
+// Claude Code OAuth tokens expire on a long-running session (token rotation
+// race when several agents share one Max account, manual logout, etc). On
+// expiry the live session goes silent — no hook fires, the pane just shows
+// "Please run /login · API Error: 401" and the operator notices only by
+// manually attaching. This independent probe captures the pane on an interval
+// (works even while IDLE) and alerts the owner exactly once per outage.
+const AUTH_FAIL_RE =
+  /please run \/login|api error: 401|invalid authentication|unauthorized request|oauth token has expired/i
+// Debounce: the pane also renders the live conversation, so a chat that merely
+// mentions "401" / "please run /login" would match. A real outage stays pinned;
+// a chat mention scrolls away. Require two CONSECUTIVE matching captures before
+// alerting — kills false positives from talking about auth, keeps genuine slips.
+const AUTH_STREAK_TO_ALERT = 2
+let authAlerted = false
+let authStreak = 0
+if (cfg.limits.login_watchdog_ms > 0) {
+  setInterval(() => {
+    void (async () => {
+      try {
+        const pane = await tmux.capturePane()
+        if (AUTH_FAIL_RE.test(pane)) {
+          authStreak += 1
+          if (authStreak >= AUTH_STREAK_TO_ALERT && !authAlerted) {
+            authAlerted = true
+            log.warn('auth failure detected in pane — login required', {
+              session: cfg.claude.tmux_session,
+              streak: authStreak,
+            })
+            if (ownerChatId) {
+              await bot.sendHtml(
+                ownerChatId,
+                `⚠️ <b>tg-bridge: слетела авторизация Claude</b>\n\n` +
+                  `Агент <code>${cfg.claude.tmux_session}</code> не достучался до API (401 / нужен /login). Бот молчит.\n\n` +
+                  `Починить:\n<pre>tmux -L ${cfg.claude.tmux_socket} attach -t ${cfg.claude.tmux_session}\n# в prompt: /login → открыть URL → код обратно\n# выйти: Ctrl-B затем D</pre>`,
+              )
+            }
+          }
+        } else {
+          authStreak = 0
+          authAlerted = false // session healthy again — re-arm for next outage
+        }
+      } catch (err) {
+        log.warn('login watchdog capturePane failed', { error: String(err) })
+      }
+    })()
+  }, cfg.limits.login_watchdog_ms)
+  log.info('login watchdog armed', { interval_ms: cfg.limits.login_watchdog_ms })
+}
 
 const server = await startHttpServer({
   host: cfg.bridge.host,
@@ -506,7 +1074,7 @@ const server = await startHttpServer({
     if (Array.isArray(b.attachments) && b.attachments.length > 0) {
       const lines = b.attachments
         .filter((a) => a && typeof a.path === 'string' && a.path.length > 0)
-        .map((a) => `Operator fayl yubordi: ${a.path}`)
+        .map((a) => `Оператор прислал файл: ${a.path}`)
       if (lines.length > 0) text = (text ? text + '\n' : '') + lines.join('\n')
     }
     // Infer channel: explicit `channel` wins; else agentId/from_agent ⇒ swarm push;
@@ -526,26 +1094,39 @@ const server = await startHttpServer({
   },
   onStop: async (body) => {
     const { assistant_message } = await handleStopHook(body as { transcript_path?: string })
-    log.info('stop hook', { msg_len: assistant_message.length, chat: Array.from(lastInbound.keys()).pop() })
+    inflight = null // the turn produced a reply ⇒ it genuinely ran; no re-queue needed
+    const { chat: targetChat, origin } = resolveReplyTarget()
+    log.info('stop hook', { msg_len: assistant_message.length, chat: targetChat })
     const { text, reactions, buttons, files } = parseReply(assistant_message)
-    const targetChat = Array.from(lastInbound.keys()).pop()
-    const origin = targetChat !== undefined ? lastInbound.get(targetChat) : undefined
     const targetMsg = origin?.message_id
     const originChannel: QueueChannel = origin?.channel ?? 'telegram'
     disarmBusyTimer()
     stopPaneWatcher()
+    stopMirror()
     stopTyping()
     if (targetChat !== undefined && (text.length > 0 || files.length > 0)) {
       await endTurnAndDelete()
       // Hybrid send-to-Telegram: always (originChannel='web' linked mode keeps
       // the operator's TG chat in the loop). DB-mirror happens below.
       if (text.length > 0) {
+        // Precision credential masking (bot tokens, sk-/ghp_/JWT/Bearer …) —
+        // NOT the broad progress-mask: full addresses/IPs/urls must survive.
+        const safeText = redactOutbound(text)
         if (buttons.length > 0) {
-          await bot.sendButtons(targetChat, text, buttons)
+          await bot.sendButtons(targetChat, safeText, buttons)
         } else {
-          const html = formatReplyHtml(text)
-          const sent = await bot.sendHtml(targetChat, html)
-          if (sent === null) await bot.sendText(targetChat, text)
+          // Rich-first: send raw markdown via sendRichMessage (native headings/
+          // tables/lists, 32768-char limit). Fall back to the proven HTML path
+          // (then plain chunked) if the rich method is unavailable or errors.
+          // RICH_MESSAGES=off skips rich entirely so text stays copyable.
+          const okRich = cfg.features.rich_messages
+            ? await bot.sendRich(targetChat, safeText)
+            : false
+          if (!okRich) {
+            const html = formatReplyHtml(safeText)
+            const sent = await bot.sendHtml(targetChat, html)
+            if (sent === null) await bot.sendText(targetChat, safeText)
+          }
         }
       }
       for (const f of files) {
@@ -553,7 +1134,12 @@ const server = await startHttpServer({
           log.warn('FILE marker path missing', { path: f.path })
           continue
         }
-        await bot.sendFile(targetChat, f)
+        const route = routeFile(f, targetChat, cfg.proactive.file_chats)
+        if (route.action === 'drop') {
+          log.warn('FILE marker dropped', { path: f.path, chat: f.chat ?? null, reason: route.reason })
+          continue
+        }
+        await bot.sendFile(route.chat, f)
       }
       if (originChannel === 'telegram') {
         if (reactions.length === 0 && targetMsg !== undefined) {
@@ -572,7 +1158,20 @@ const server = await startHttpServer({
         const dbText = text.length > 0 ? text : files.map((f) => `[file] ${f.path}`).join('\n')
         void dbInsertOut(originChannel, dbText, outMeta)
       }
+      // Ответ на это сообщение отдан — служебная строка по нему уже не нужна.
+      if (targetMsg !== undefined) lastSilentNoticeMsgId = targetMsg
     } else {
+      if (
+        targetChat !== undefined &&
+        originChannel === 'telegram' &&
+        targetMsg !== undefined &&
+        targetMsg > 0 &&
+        targetMsg !== lastSilentNoticeMsgId
+      ) {
+        lastSilentNoticeMsgId = targetMsg
+        log.info('silent turn notice', { chat: targetChat, message_id: targetMsg })
+        await bot.sendText(targetChat, SILENT_TURN_NOTICE)
+      }
       await endTurn('done')
     }
     void dbSetIdle()
@@ -588,6 +1187,9 @@ const server = await startHttpServer({
     if (awaitingUserTool && tool === awaitingUserTool) {
       log.info('user answered, resuming heartbeat', { tool })
       awaitingUserTool = null
+      // Modal resolved (possibly answered straight in the TUI) — drop any stale
+      // surfaced question still sitting in the chat.
+      clearAwaitingModal(true)
     }
     armBusyTimer()
     if (active) startPaneWatcher()
@@ -622,14 +1224,14 @@ const server = await startHttpServer({
       disarmBusyTimer()
       stopPaneWatcher()
       log.info('awaiting user input — heartbeat frozen', { tool: toolName })
-      const surfaceChat = Array.from(lastInbound.keys()).pop()
-        ?? cfg.features.owner_user_ids[0]
+      const surfaceChat = resolveReplyTarget().chat
       if (surfaceChat !== undefined) {
         void (async () => {
           try {
             const html = renderAwaitingUserPrompt(toolName, toolArgs)
             if (html) {
               const msgId = await bot.sendHtml(surfaceChat, html)
+              if (msgId !== null) awaitingModal = { chat: surfaceChat, msgId }
               log.info('modal surfaced to telegram', { chat: surfaceChat, msg_id: msgId })
             } else {
               log.warn('renderAwaitingUserPrompt returned null', { tool: toolName })
@@ -645,6 +1247,7 @@ const server = await startHttpServer({
       if (awaitingUserTool) {
         log.info('user activity detected, resuming heartbeat', { prev: awaitingUserTool })
         awaitingUserTool = null
+        clearAwaitingModal(true)
       }
       armBusyTimer()
       if (active) startPaneWatcher()
@@ -653,6 +1256,7 @@ const server = await startHttpServer({
       active.tracker.onTaskStart(toolArgs)
       scheduleEdit(active)
     }
+    inflight = null // a tool fired ⇒ the turn genuinely started; no re-queue needed
     const inv = { tool: toolName, args: toolArgs }
     log.info('pretool', { tool: toolName, relay: needsRelay(inv, policy) })
     if (!needsRelay(inv, policy)) {
@@ -695,6 +1299,21 @@ await bot.start(async (update) => {
       message?: { chat: { id: number }; message_id: number }
     }
   }
+  // DIAG-FORWARD-20260620: temporary raw-update probe. Logs the shape of every
+  // update so we can see whether a forwarded message reaches the bridge at all
+  // and which fields it carries. Remove once forward handling is confirmed.
+  try {
+    const raw = update as Record<string, unknown>
+    const m = raw.message as Record<string, unknown> | undefined
+    log.info('DIAG raw update', {
+      update_keys: Object.keys(raw),
+      has_message: !!m,
+      msg_keys: m ? Object.keys(m) : null,
+      text_len: m ? String((m.text ?? m.caption ?? '')).length : 0,
+      from_id: m ? (m.from as { id?: number } | undefined)?.id : null,
+      chat_id: m ? (m.chat as { id?: number } | undefined)?.id : null,
+    })
+  } catch { /* never let diag break the handler */ }
   if (u.message) await onTelegramMessage(u.message)
   if (u.callback_query?.data) {
     const data = u.callback_query.data
@@ -716,7 +1335,10 @@ await bot.start(async (update) => {
         if (u.callback_query.id) {
           await bot.raw.api.answerCallbackQuery(u.callback_query.id, { text: payload }).catch(() => {})
         }
-        await bot.clearButtons(chatId, msgId)
+        // Answer chosen — the question is in the mirror, so drop the surfaced
+        // option-question message instead of just clearing its buttons.
+        await bot.deleteMessage(chatId, msgId)
+        if (awaitingModal?.msgId === msgId) awaitingModal = null
         queue.push({ chat_id: chatId, user_id: fromId, text: payload, message_id: msgId, channel: 'telegram' })
         void drain()
       }
@@ -725,6 +1347,72 @@ await bot.start(async (update) => {
 })
 
 log.info('bot polling started', { bot_id: cfg.telegram.bot_id })
+
+// Health watchdog (fix B, FIX-POLL-WATCHDOG-2026-08-13.md). Covers API-path
+// degradation the poller can't see from inside: getMe goes through timedFetch,
+// so a dead backend surfaces as an error within its timeout budget instead of
+// hanging. Three consecutive failures -> exit(1), systemd's Restart=on-failure
+// brings the bridge back with a fresh network stack.
+// Storm guard: during a provider-side outage measured in hours (2026-08-13 was
+// ~3h, and restarts provably don't help — the failure sits past Telegram's
+// edge) an exit every ~3 minutes is pure churn, so after 5 watchdog exits
+// inside 30 minutes the watchdog stops exiting and keeps logging until the API
+// answers again. Exit timestamps persist across restarts in the state file.
+const HEALTH_INTERVAL_MS = 60_000
+// Env-overridable: when Telegram is throttling THIS token, restarting only feeds the
+// throttle. Keep the process up and let it keep retrying instead of exiting.
+const HEALTH_EXIT_THRESHOLD = Number(process.env.BRIDGE_HEALTH_EXIT_THRESHOLD ?? 3)
+const STORM_WINDOW_MS = 30 * 60_000
+const STORM_MAX_EXITS = 5
+const healthStateFile = join(homedir(), '.local', 'state', 'tg-bridge-a2', `health-exits-${cfg.telegram.bot_id}.json`)
+
+function readHealthExits(): number[] {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(healthStateFile, 'utf8'))
+    return Array.isArray(parsed) ? parsed.filter((t): t is number => typeof t === 'number') : []
+  } catch {
+    return []
+  }
+}
+
+function writeHealthExits(ts: number[]): void {
+  try {
+    mkdirSync(dirname(healthStateFile), { recursive: true })
+    writeFileSync(healthStateFile, JSON.stringify(ts))
+  } catch (err) {
+    log.warn('health watchdog: cannot persist exit timestamps', { error: String(err) })
+  }
+}
+
+let healthFailures = 0
+setInterval(async () => {
+  try {
+    await bot.getMe()
+    if (healthFailures > 0) log.info('telegram api health recovered', { after_failures: healthFailures })
+    healthFailures = 0
+  } catch (err) {
+    healthFailures++
+    log.warn('telegram api health check failed', { n: healthFailures, error: String(err) })
+    if (healthFailures < HEALTH_EXIT_THRESHOLD) return
+    const recentExits = readHealthExits().filter((t) => Date.now() - t < STORM_WINDOW_MS)
+    if (recentExits.length >= STORM_MAX_EXITS) {
+      // Log at a low duty cycle — once per ~5 checks — so a multi-hour outage
+      // does not flood bridge.err while the guard holds the process alive.
+      if (healthFailures % 5 === 0) {
+        log.error('health watchdog: API still unreachable, storm guard active — staying up', {
+          consecutive_failures: healthFailures,
+          exits_last_30m: recentExits.length,
+        })
+      }
+      return
+    }
+    writeHealthExits([...recentExits, Date.now()])
+    log.error('health watchdog: consecutive failures reached threshold, exiting for systemd restart', {
+      consecutive_failures: healthFailures,
+    })
+    process.exit(1)
+  }
+}, HEALTH_INTERVAL_MS)
 
 const shutdown = async () => {
   log.info('shutting down')

@@ -37,4 +37,30 @@ describe('relay', () => {
     })
     expect(() => relay.callbackAnswer('does-not-exist', 'allow')).not.toThrow()
   })
+
+  test('answerLatest resolves the newest pending request via text reply', async () => {
+    const relay = createRelay({
+      sendPrompt: async () => {},
+      ownerChatId: 100000001,
+      timeoutMs: 1000,
+      defaultDecision: 'deny',
+    })
+    expect(relay.pendingCount()).toBe(0)
+    const v = relay.requestVerdict({ tool: 'Bash', args: { command: 'sudo systemctl restart x' } })
+    await new Promise(r => setTimeout(r, 10))
+    expect(relay.pendingCount()).toBe(1)
+    expect(relay.answerLatest('allow')).toBe(true)
+    expect(await v).toBe('allow')
+    expect(relay.pendingCount()).toBe(0)
+  })
+
+  test('answerLatest returns false when nothing is pending', () => {
+    const relay = createRelay({
+      sendPrompt: async () => {},
+      ownerChatId: 100000001,
+      timeoutMs: 100,
+      defaultDecision: 'deny',
+    })
+    expect(relay.answerLatest('allow')).toBe(false)
+  })
 })

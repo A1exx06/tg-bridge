@@ -44,8 +44,12 @@ describe('markdownToHtml', () => {
     expect(markdownToHtml('**bold** and *italic*')).toBe('<b>bold</b> and <i>italic</i>')
   })
 
-  test('fenced code with lang', () => {
-    expect(markdownToHtml('```js\nconst x = 1\n```')).toBe('<pre><code>const x = 1</code></pre>')
+  test('fenced code with lang carries language class (Telegram copy button)', () => {
+    expect(markdownToHtml('```js\nconst x = 1\n```')).toBe('<pre><code class="language-js">const x = 1</code></pre>')
+  })
+
+  test('fenced code without lang defaults to language-text', () => {
+    expect(markdownToHtml('```\nplain\n```')).toBe('<pre><code class="language-text">plain</code></pre>')
   })
 
   test('link', () => {

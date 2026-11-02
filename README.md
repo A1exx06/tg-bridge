@@ -269,3 +269,26 @@ bun run start
 ## Лицензия
 
 Apache-2.0
+
+### Inbox watcher recovery
+
+With `INPUT_CHANNEL=inbox`, the watcher retries failed or missing `inotifywait`
+with bounded polling backoff (1–8 seconds). A five-second inotify timeout also
+covers missed events. It does not depend on redirects to `/dev/null`.
+An inbox-scoped `flock` prevents concurrent consumers; the lock file must not be
+removed while a watcher is running. `.watcher-heartbeat` records each drain cycle.
+
+The bridge checks pending inbox files every 30 seconds. After three minutes it
+alerts the owner once per backlog episode and attempts to start a replacement
+watcher against the existing live tmux pane. Claude and the bridge are not
+restarted. A live watcher holding the lock (including one waiting for a busy
+Claude) is never forcibly interrupted; the alert can therefore also indicate a
+long-running turn rather than a dead process. Recovery retries until delivery
+resumes; alert state resets when the old backlog clears.
+
+Recovery is enabled only when `.watcher-parent` matches the current pane PID.
+Pre-upgrade watchers do not hold the new lock, so the server alerts but refuses
+a competing consumer for legacy panes. The owner must start the new entrypoint
+on a planned Claude/session restart to enable automatic recovery there.
+Unconfirmed submissions stay in the inbox; busy timeouts do not enqueue copies.
+Archive failures retry archiving without resubmitting in the same watcher.

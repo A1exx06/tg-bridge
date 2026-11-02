@@ -88,8 +88,11 @@ export function markdownToHtml(input: string): string {
     return placeholderAt(idx)
   }
   let s = input
-  s = s.replace(/```([a-zA-Z0-9_-]*)\n?([\s\S]*?)```/g, (_m, _lang: string, code: string) => {
-    return stash(`<pre><code>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`)
+  s = s.replace(/```([a-zA-Z0-9_-]*)\n?([\s\S]*?)```/g, (_m, lang: string, code: string) => {
+    // Telegram shows the "copy" button only for <pre><code class="language-x">
+    // blocks; a bare <pre><code> renders as a scrolling box without it.
+    const cls = ` class="language-${lang || 'text'}"`
+    return stash(`<pre><code${cls}>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`)
   })
   s = s.replace(/`([^`\n]+)`/g, (_m, code: string) => stash(`<code>${escapeHtml(code)}</code>`))
   s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_m, label: string, url: string) => {

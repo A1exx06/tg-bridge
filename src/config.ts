@@ -24,6 +24,11 @@ const EnvSchema = z.object({
   TMUX_SESSION: z.string().min(1),
   CLAUDE_BINARY: z.string().min(1),
   CLAUDE_FLAGS: z.string().default('--dangerously-skip-permissions'),
+  // Input path: 'sendkeys' drives the pane from outside with `tmux
+  // send-keys` (legacy, default). 'inbox' persists each message and lets an
+  // in-session watcher inject it (feature/inbox-channel, plan B). Per-agent
+  // opt-in for a staged cutover; the fleet stays on sendkeys until flipped.
+  INPUT_CHANNEL: z.enum(['sendkeys', 'inbox']).default('sendkeys'),
   WORKSPACE: z.string().min(1),
   STATE_DIR: z.string().min(1),
   LOG_DIR: z.string().min(1),
@@ -34,9 +39,33 @@ const EnvSchema = z.object({
   PERMISSION_DEFAULT: z.enum(['allow', 'deny']).default('deny'),
   QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(100),
   BUSY_TIMEOUT_MS: z.coerce.number().int().positive().default(300000),
-  STREAMING_MODE: z.enum(['off', 'partial', 'progress']).default('progress'),
+  LOGIN_WATCHDOG_MS: z.coerce.number().int().nonnegative().default(60000),
+  STREAMING_MODE: z.enum(['off', 'partial', 'progress']).default('off'),
+  // Rich outbound rendering via sendRichMessage. Default on (native headings/
+  // tables). Set RICH_MESSAGES=off per channel to send copyable HTML/plain text
+  // instead — rich blocks render but Telegram forbids copying their text.
+  RICH_MESSAGES: z
+    .union([z.boolean(), z.string()])
+    .default(true)
+    .transform((v) => {
+      if (typeof v === 'boolean') return v
+      const s = v.trim().toLowerCase()
+      return s === 'true' || s === '1' || s === 'yes' || s === 'on'
+    }),
+  MIRROR_ENABLED: z
+    .union([z.boolean(), z.string()])
+    .default(true)
+    .transform((v) => {
+      if (typeof v === 'boolean') return v
+      const s = v.trim().toLowerCase()
+      return s === 'true' || s === '1' || s === 'yes' || s === 'on'
+    }),
+  MIRROR_INTERVAL_MS: z.coerce.number().int().min(3000).default(5000),
+  MIRROR_START_DELAY_MS: z.coerce.number().int().nonnegative().default(12000),
+  MIRROR_MAX_LINES: z.coerce.number().int().positive().default(40),
   GROQ_API_KEY_FILE: z.string().optional(),
   UPLOADS_TTL_DAYS: z.coerce.number().int().nonnegative().default(30),
+  PROACTIVE_FILE_CHATS: z.string().optional(),
   DATABASE_URL_FILE: z.string().optional(),
   AGENT_NAME: z.string().optional(),
 })
@@ -55,10 +84,12 @@ export interface AppConfig {
     workspace: string
     tmux_socket: string
     tmux_session: string
+    input_channel: 'sendkeys' | 'inbox'
   }
   features: {
     business_api: boolean
     inject_sender_identity: boolean
+    rich_messages: boolean
     owner_user_ids: number[]
   }
   paths: { state_dir: string; log_dir: string }
@@ -67,10 +98,13 @@ export interface AppConfig {
     permission_default: 'allow' | 'deny'
     queue_max_depth: number
     busy_timeout_ms: number
+    login_watchdog_ms: number
   }
   streaming: { mode: 'off' | 'partial' | 'progress' }
+  mirror: { enabled: boolean; interval_ms: number; start_delay_ms: number; max_lines: number }
   voice: { groq_api_key_file: string | null }
   uploads: { ttl_days: number }
+  proactive: { file_chats: number[] }
   db: { dsn_file: string | null; agent_name: string }
 }
 
@@ -97,10 +131,12 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
       workspace: parsed.WORKSPACE,
       tmux_socket: parsed.TMUX_SOCKET,
       tmux_session: parsed.TMUX_SESSION,
+      input_channel: parsed.INPUT_CHANNEL,
     },
     features: {
       business_api: parsed.BUSINESS_API_ENABLED,
       inject_sender_identity: parsed.INJECT_SENDER_IDENTITY,
+      rich_messages: parsed.RICH_MESSAGES,
       owner_user_ids: ownerIds,
     },
     paths: { state_dir: parsed.STATE_DIR, log_dir: parsed.LOG_DIR },
@@ -109,10 +145,18 @@ export function loadConfig(env: Record<string, string | undefined>): AppConfig {
       permission_default: parsed.PERMISSION_DEFAULT,
       queue_max_depth: parsed.QUEUE_MAX_DEPTH,
       busy_timeout_ms: parsed.BUSY_TIMEOUT_MS,
+      login_watchdog_ms: parsed.LOGIN_WATCHDOG_MS,
     },
     streaming: { mode: parsed.STREAMING_MODE },
+    mirror: {
+      enabled: parsed.MIRROR_ENABLED,
+      interval_ms: parsed.MIRROR_INTERVAL_MS,
+      start_delay_ms: parsed.MIRROR_START_DELAY_MS,
+      max_lines: parsed.MIRROR_MAX_LINES,
+    },
     voice: { groq_api_key_file: parsed.GROQ_API_KEY_FILE ?? null },
     uploads: { ttl_days: parsed.UPLOADS_TTL_DAYS },
+    proactive: { file_chats: csvNums(parsed.PROACTIVE_FILE_CHATS) },
     db: {
       dsn_file: parsed.DATABASE_URL_FILE ?? null,
       agent_name: parsed.AGENT_NAME ?? parsed.TMUX_SESSION,

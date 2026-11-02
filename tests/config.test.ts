@@ -27,7 +27,7 @@ describe('config', () => {
     expect(cfg.limits.permission_timeout_ms).toBe(50000)
     expect(cfg.limits.busy_timeout_ms).toBe(300000)
     expect(cfg.limits.queue_max_depth).toBe(100)
-    expect(cfg.streaming.mode).toBe('progress')
+    expect(cfg.streaming.mode).toBe('off')
     expect(cfg.voice.groq_api_key_file).toBeNull()
   })
 
@@ -57,6 +57,29 @@ describe('config', () => {
 
   test('rejects missing TELEGRAM_BOT_TOKEN', () => {
     expect(() => loadConfig({})).toThrow(/TELEGRAM_BOT_TOKEN/)
+  })
+
+  test('PROACTIVE_FILE_CHATS — empty by default', () => {
+    const env = {
+      TELEGRAM_BOT_TOKEN: 't', TELEGRAM_BOT_ID: '1',
+      TELEGRAM_ALLOWED_USER_IDS: '1', TELEGRAM_ALLOWED_CHAT_IDS: '1',
+      BRIDGE_PORT: '9091', BRIDGE_BEARER_TOKEN: 't',
+      TMUX_SOCKET: 's', TMUX_SESSION: 's',
+      CLAUDE_BINARY: '/c', WORKSPACE: '/w', STATE_DIR: '/s', LOG_DIR: '/l',
+    }
+    expect(loadConfig(env).proactive.file_chats).toEqual([])
+  })
+
+  test('PROACTIVE_FILE_CHATS — parses CSV chat ids', () => {
+    const env = {
+      TELEGRAM_BOT_TOKEN: 't', TELEGRAM_BOT_ID: '1',
+      TELEGRAM_ALLOWED_USER_IDS: '1', TELEGRAM_ALLOWED_CHAT_IDS: '1',
+      BRIDGE_PORT: '9091', BRIDGE_BEARER_TOKEN: 't',
+      TMUX_SOCKET: 's', TMUX_SESSION: 's',
+      CLAUDE_BINARY: '/c', WORKSPACE: '/w', STATE_DIR: '/s', LOG_DIR: '/l',
+      PROACTIVE_FILE_CHATS: '897656531, 123',
+    }
+    expect(loadConfig(env).proactive.file_chats).toEqual([897656531, 123])
   })
 
   test('strictBool: "false" string parses as false', () => {

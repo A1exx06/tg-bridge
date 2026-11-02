@@ -11,6 +11,7 @@ export interface ParsedFile {
   path: string
   caption?: string
   kind?: 'photo' | 'video' | 'document' | 'voice'
+  chat?: number
 }
 
 export interface ParsedReply {
@@ -26,21 +27,26 @@ function parseFileSpec(raw: string): ParsedFile | null {
   let path = s
   let caption: string | undefined
   let kind: ParsedFile['kind']
+  let chat: number | undefined
   const capIdx = s.search(/\s+caption=/)
   const kindIdx = s.search(/\s+kind=/)
-  const firstAttr = [capIdx, kindIdx].filter((i) => i >= 0).sort((a, b) => a - b)[0]
+  const chatIdx = s.search(/\s+chat=/)
+  const firstAttr = [capIdx, kindIdx, chatIdx].filter((i) => i >= 0).sort((a, b) => a - b)[0]
   if (firstAttr !== undefined) {
     path = s.slice(0, firstAttr).trim()
     const tail = s.slice(firstAttr)
-    const cap = tail.match(/\s+caption=("([^"]*)"|([^\s][^\s]*(?:\s+(?!kind=)[^\s]+)*))/)
+    const cap = tail.match(/\s+caption=("([^"]*)"|([^\s][^\s]*(?:\s+(?!kind=|chat=)[^\s]+)*))/)
     if (cap) caption = (cap[2] ?? cap[3] ?? '').trim()
     const kk = tail.match(/\s+kind=(photo|video|document|voice)/i)
     if (kk && kk[1]) kind = kk[1].toLowerCase() as ParsedFile['kind']
+    const ch = tail.match(/\s+chat=(\d+)/)
+    if (ch && ch[1]) chat = Number(ch[1])
   }
   if (path.length === 0) return null
   const out: ParsedFile = { path }
   if (caption !== undefined && caption.length > 0) out.caption = caption
   if (kind !== undefined) out.kind = kind
+  if (chat !== undefined && Number.isFinite(chat)) out.chat = chat
   return out
 }
 
