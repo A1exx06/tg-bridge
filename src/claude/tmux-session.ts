@@ -1,4 +1,4 @@
-import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
@@ -174,6 +174,11 @@ export function createTmuxSession(opts: TmuxSessionOpts): TmuxSession {
         '#{pane_id} #{pane_pid} #{pane_dead}'])
       const [id, pid, dead] = pane.stdout.trim().split(/\s+/)
       if (!pane.ok || !id || !pid || dead !== '0' || !/^\d+$/.test(pid)) return false
+      // A legacy watcher has no flock. Never start a competing consumer
+      // until this exact pane generation has run the new entrypoint.
+      try {
+        if (readFileSync(join(opts.inboxDir, '.watcher-parent'), 'utf8').trim() !== pid) return false
+      } catch { return false }
       // run-shell detaches the watcher from this server, not from Claude's
       // lifetime. The script checks the pane PID and holds the inbox flock.
       const command = ['bash', entrypointPath, '--watcher', pid, id, opts.socket, opts.inboxDir]

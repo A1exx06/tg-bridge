@@ -286,6 +286,9 @@ Claude) is never forcibly interrupted; the alert can therefore also indicate a
 long-running turn rather than a dead process. Recovery retries until delivery
 resumes; alert state resets when the old backlog clears.
 
-Rollout requires the owner to install this version and start the new entrypoint
-on the next planned Claude/session restart. Pre-upgrade watchers do not hold the
-new lock: do not enable the new server watchdog alongside a legacy watcher.
+Recovery is enabled only when `.watcher-parent` matches the current pane PID.
+Pre-upgrade watchers do not hold the new lock, so the server alerts but refuses
+a competing consumer for legacy panes. The owner must start the new entrypoint
+on a planned Claude/session restart to enable automatic recovery there.
+Unconfirmed submissions stay in the inbox; busy timeouts do not enqueue copies.
+Archive failures retry archiving without resubmitting in the same watcher.

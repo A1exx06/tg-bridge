@@ -354,7 +354,9 @@ const armBusyTimer = (): void => {
       if (inflight) {
         void alertIfUsageLimit()
         log.warn('re-queuing swallowed message after busy timeout', { len: inflight.text.length })
-        queue.push(inflight)
+        // Inbox already persists the message: requeue would create a new
+        // JSON copy on every timeout while the watcher is unavailable.
+        if (cfg.claude.input_channel !== 'inbox') queue.push(inflight)
         inflight = null
       }
       fsm.forceIdle()
@@ -980,6 +982,7 @@ if (cfg.claude.input_channel === 'inbox') {
     checking = true
     void (async () => {
       try {
+        if (!existsSync(inbox)) return
         const pending = readdirSync(inbox).filter(name => name.endsWith('.json'))
         const oldest = pending.reduce((age, name) => {
           try { return Math.min(age, statSync(join(inbox, name)).mtimeMs) }

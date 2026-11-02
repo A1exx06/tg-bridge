@@ -50,6 +50,10 @@ BUSY_POLL_INTERVAL="${CHAT_BUSY_POLL_INTERVAL:-2}"
 BUSY_WAIT_MAX="${CHAT_BUSY_WAIT_MAX:-3600}"
 BUSY_PATTERN="${CHAT_BUSY_PATTERN:-esc to interrupt|Compacting conversation|Bootstrapping}"
 
+# Remember completed submissions across archive retries in this watcher.
+declare -A pending_archives=()
+parent_alive() { return 0; }
+
 # ───── Injection helpers (PANE is a global set by the watcher subshell) ─────
 
 # Plain-text snapshot of the VISIBLE pane only. -p strips attributes, -J
@@ -66,6 +70,7 @@ pane_text() {
 wait_claude_ready() {
   local i
   for ((i = 0; i < READY_POLL_MAX; i++)); do
+    parent_alive || return 1
     if pane_text | grep -q '❯'; then
       sleep "$READY_POLL_INTERVAL"
       return 0
@@ -82,6 +87,7 @@ wait_claude_ready() {
 wait_claude_idle() {
   local waited=0
   while pane_text | grep -qiE "$BUSY_PATTERN"; do
+    parent_alive || return 1
     if (( waited >= BUSY_WAIT_MAX )); then
       echo "chat-entrypoint(watcher): busy-wait timeout after ${waited}s, injecting anyway" >&2
       return 0
@@ -115,8 +121,9 @@ submit_prompt() {
   local fp attempt delay buf out pre_generating
   fp="$(prompt_fingerprint "$msg_text")"
 
-  wait_claude_ready
-  wait_claude_idle
+  wait_claude_ready || return 1
+  wait_claude_idle || return 1
+  parent_alive || return 1
 
   pre_generating=0
   if pane_text | grep -qiE 'esc to interrupt'; then
@@ -137,6 +144,7 @@ submit_prompt() {
 
   delay="$SUBMIT_RETRY_DELAY"
   for ((attempt = 1; attempt <= SUBMIT_RETRY_MAX; attempt++)); do
+    parent_alive || return 1
     tmux send-keys -t "$PANE" Enter || true
     sleep "$delay"
 
@@ -213,22 +221,35 @@ archive_inbox_file() {
 }
 
 process_inbox() {
-  local f msg_text rc
+  local f msg_text rc dest
+  mkdir -p "$PROCESSED" || return 1
   while IFS= read -r -d '' f; do
+    parent_alive || return 1
     [[ -f "$f" ]] || continue
+    if [[ -n "${pending_archives[$f]:-}" ]]; then
+      archive_inbox_file "$f" "${pending_archives[$f]}" || return 1
+      unset 'pending_archives[$f]'
+      continue
+    fi
     rc=0
     msg_text="$(build_prompt "$f")" || rc=$?
     if [[ "$rc" -eq 3 ]]; then
-      archive_inbox_file "$f" "${PROCESSED}/skipped-empty-$(basename "$f")"
+      dest="${PROCESSED}/skipped-empty-$(basename "$f")"
     elif [[ "$rc" -eq 0 && -n "$msg_text" ]]; then
       if submit_prompt "$msg_text"; then
-        archive_inbox_file "$f" "${PROCESSED}/$(basename "$f")"
+        dest="${PROCESSED}/$(basename "$f")"
       else
-        archive_inbox_file "$f" "${PROCESSED}/submit-unconfirmed-$(basename "$f")"
+        # Keep unconfirmed input durable. Server busy timeouts must not
+        # create another JSON copy just to retry delivery.
+        return 1
       fi
     else
-      archive_inbox_file "$f" "${PROCESSED}/parse-failed-$(basename "$f")"
+      dest="${PROCESSED}/parse-failed-$(basename "$f")"
     fi
+    # Never submit again just because archiving a delivered file failed.
+    pending_archives[$f]="$dest"
+    archive_inbox_file "$f" "$dest" || return 1
+    unset 'pending_archives[$f]'
   done < <(find "$INBOX" -maxdepth 1 -name '*.json' -print0 | sort -z)
 }
 
@@ -236,11 +257,20 @@ process_inbox() {
 # the lock file: all generations must contend on the same inode.
 run_inbox_watcher() {
   local parent_pid="$1" backoff=1 rc
-  exec 9>"${INBOX}/.watcher.lock"
-  flock -n 9 || return 0
   parent_alive() { kill -0 "$parent_pid" 2>&-; }
+  until { exec 9>"${INBOX}/.watcher.lock"; }; do
+    parent_alive || return 0
+    sleep 1
+  done
+  until flock -n 9; do
+    [[ "${2:-wait}" == "recover" ]] && return 0
+    parent_alive || return 0
+    sleep 0.5
+  done
+  parent_alive || return 0
+  printf '%s\n' "$parent_pid" >"${INBOX}/.watcher-parent" || return 1
   while parent_alive; do
-    touch "${INBOX}/.watcher-heartbeat"
+    touch "${INBOX}/.watcher-heartbeat" || true
     process_inbox || echo "chat-entrypoint(watcher): drain failed; retrying" >&2
     parent_alive || break
     rc=0
@@ -250,6 +280,8 @@ run_inbox_watcher() {
     if [[ "$rc" -eq 0 || "$rc" -eq 2 ]]; then
       backoff=1
       sleep 0.1
+    elif [[ "$rc" -eq 127 ]]; then
+      sleep 0.5
     else
       echo "chat-entrypoint(watcher): inotifywait failed ($rc); polling in ${backoff}s" >&2
       sleep "$backoff"
@@ -272,10 +304,9 @@ if [[ "${1:-}" == "--watcher" ]]; then
   unset TELEGRAM_BOT_TOKEN
   parent_pid="$2"; PANE="$3"; socket="$4"; INBOX="$5"
   PROCESSED="${INBOX}/.processed"
-  mkdir -p "$PROCESSED"
+  exec >>"${INBOX}/watcher.log" 2>&1
   tmux() { command tmux -L "$socket" "$@"; }
-  exec 2>>"${INBOX}/watcher.log"
-  run_inbox_watcher "$parent_pid"
+  run_inbox_watcher "$parent_pid" recover || true
   exit 0
 fi
 
