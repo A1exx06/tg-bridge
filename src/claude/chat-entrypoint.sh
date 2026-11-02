@@ -203,6 +203,15 @@ PYEOF
 
 # Drain every committed *.json in inbox/ (sorted = ms-time order). We do not
 # recurse into .processed/ (find -maxdepth 1 + the *.json glob).
+archive_inbox_file() {
+  local src="$1" dest="$2"
+  # Another consumer may have archived it during submit_prompt's wait.
+  # A vanished source is benign; real move failures remain fatal/visible.
+  [[ -e "$src" ]] || return 0
+  if mv "$src" "$dest"; then return 0; fi
+  [[ ! -e "$src" ]]
+}
+
 process_inbox() {
   local f msg_text rc
   while IFS= read -r -d '' f; do
@@ -210,15 +219,15 @@ process_inbox() {
     rc=0
     msg_text="$(build_prompt "$f")" || rc=$?
     if [[ "$rc" -eq 3 ]]; then
-      mv "$f" "${PROCESSED}/skipped-empty-$(basename "$f")"
+      archive_inbox_file "$f" "${PROCESSED}/skipped-empty-$(basename "$f")"
     elif [[ "$rc" -eq 0 && -n "$msg_text" ]]; then
       if submit_prompt "$msg_text"; then
-        mv "$f" "${PROCESSED}/$(basename "$f")"
+        archive_inbox_file "$f" "${PROCESSED}/$(basename "$f")"
       else
-        mv "$f" "${PROCESSED}/submit-unconfirmed-$(basename "$f")"
+        archive_inbox_file "$f" "${PROCESSED}/submit-unconfirmed-$(basename "$f")"
       fi
     else
-      mv "$f" "${PROCESSED}/parse-failed-$(basename "$f")"
+      archive_inbox_file "$f" "${PROCESSED}/parse-failed-$(basename "$f")"
     fi
   done < <(find "$INBOX" -maxdepth 1 -name '*.json' -print0 | sort -z)
 }

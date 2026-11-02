@@ -612,6 +612,32 @@ const renderStatus = (): string => {
   return `<pre>${lines.join('\n')}</pre>`
 }
 
+// Known Whisper hallucination tails on Russian silence; a sentence made only of these is dropped.
+const HALLUCINATION_RE = /(субтитры\s+(делал|сделал|создал|подготовил)|dimatorzok|редактор субтитров|продолжение следует|спасибо за (внимание|просмотр)|подписывайтесь на канал)/i
+const dropHallucinations = (t: string): string =>
+  t.split(/(?<=[.!?…])\s+/).filter((sent) => !HALLUCINATION_RE.test(sent)).join(' ').trim()
+
+// Cut silence longer than 0.6 s at both ends (and collapse mid pauses to 0.6 s) and re-encode to 16 kHz mono ogg/opus.
+const trimSilence = async (
+  buf: ArrayBuffer, filename: string,
+): Promise<{ buf: ArrayBuffer; filename: string; mime: string; applied: boolean }> => {
+  const mime = filename.endsWith('.ogg') || filename.endsWith('.oga') ? 'audio/ogg' : 'audio/mpeg'
+  try {
+    const proc = Bun.spawn([
+      'ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', 'pipe:0',
+      '-af', 'silenceremove=start_periods=1:start_threshold=-40dB:start_silence=0.3,'
+        + 'areverse,silenceremove=start_periods=1:start_threshold=-40dB:start_silence=0.3,areverse',
+      '-ac', '1', '-ar', '16000', '-c:a', 'libopus', '-b:a', '32k', '-f', 'ogg', 'pipe:1',
+    ], { stdin: new Uint8Array(buf), stdout: 'pipe', stderr: 'pipe' })
+    const out = await new Response(proc.stdout).arrayBuffer()
+    const code = await proc.exited
+    if (code !== 0 || out.byteLength < 1000) return { buf, filename, mime, applied: false }
+    return { buf: out, filename: 'voice.ogg', mime: 'audio/ogg', applied: true }
+  } catch {
+    return { buf, filename, mime, applied: false }
+  }
+}
+
 const transcribeIfVoice = async (msg: {
   voice?: { file_id: string; duration?: number }
   audio?: { file_id: string }
@@ -628,13 +654,17 @@ const transcribeIfVoice = async (msg: {
     const mime = filename.endsWith('.ogg') || filename.endsWith('.oga')
       ? 'audio/ogg'
       : 'audio/mpeg'
+    // Whisper hallucinates on leading/trailing silence ("Субтитры делал ...", "Продолжение следует"):
+    // trim silence with ffmpeg first (20.09.2026), fall back to the raw file if ffmpeg is unavailable.
+    const trimmed = await trimSilence(buf, filename)
     // Owner speaks Russian; without a language hint Whisper guesses per message and garbles words.
-    const text = await transcribeAudio({
-      apiKey: key, audio: buf, filename, mimeType: mime,
+    const raw = await transcribeAudio({
+      apiKey: key, audio: trimmed.buf, filename: trimmed.filename, mimeType: trimmed.mime,
       language: process.env.VOICE_LANGUAGE || 'ru',
       prompt: process.env.VOICE_PROMPT || DEFAULT_VOICE_PROMPT,
     })
-    log.info('voice transcribed', { len: text.length })
+    const text = dropHallucinations(raw)
+    log.info('voice transcribed', { len: text.length, rawLen: raw.length, trimmed: trimmed.applied })
     return text
   } catch (err) {
     log.warn('voice transcription failed', { error: String(err) })
